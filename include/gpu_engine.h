@@ -81,6 +81,14 @@ typedef struct {
     uint64_t                    ticket;            /* Generation counter: matches submit ticket */
 } gpu_result_t;
 
+/* ── Engine Metrics ────────────────────────────────────────────────────── */
+typedef struct {
+    uint64_t queue_full_events;
+    uint64_t items_submitted;
+    uint64_t items_completed;
+    uint64_t total_poll_spins;
+} gpu_engine_metrics_t;
+
 /* ── Opaque engine handle ──────────────────────────────────────────────── */
 typedef struct gpu_engine gpu_engine_t;
 
@@ -135,6 +143,14 @@ int gpu_engine_poll(gpu_engine_t *engine, uint64_t ticket,
  */
 int gpu_engine_submit_and_wait(gpu_engine_t *engine, gpu_work_item_t *item,
                                gpu_result_t *result);
+
+/**
+ * Retrieve current engine metrics.
+ *
+ * @param engine   Engine handle
+ * @param metrics  Pointer to receive metrics
+ */
+void gpu_engine_get_metrics(gpu_engine_t *engine, gpu_engine_metrics_t *metrics);
 
 /**
  * Get the work item from the queue (for reading results like CRC).

@@ -31,6 +31,12 @@ struct gpu_engine {
     /* Shutdown flag */
     volatile int       *shutdown;       /* pinned memory */
 
+    /* Metrics */
+    volatile uint64_t   queue_full_events;
+    volatile uint64_t   items_submitted;
+    volatile uint64_t   items_completed;
+    volatile uint64_t   total_poll_spins;
+
     /* CUDA stream for the persistent kernel */
     cudaStream_t        stream;
 };
@@ -182,6 +188,12 @@ __global__ void persistent_kernel(
         __syncthreads();
 
         /* ── Mark result as ready (visible to CPU) ────────────────── */
+        if (s_item.op_type == GPU_OP_COMPRESS_LZ4 || s_item.op_type == GPU_OP_DECOMPRESS_LZ4 ||
+            s_item.op_type == GPU_OP_EC_ENCODE    || s_item.op_type == GPU_OP_EC_DECODE) {
+            __threadfence_system();
+        }
+        __syncthreads();
+
         if (tid == 0) {
             result->ticket = my_tail; /* Generation counter */
             item->op_type = GPU_OP_INVALID; /* Free slot for next use */
@@ -317,6 +329,7 @@ int gpu_engine_submit(gpu_engine_t *engine, const gpu_work_item_t *item,
 
         /* Check if queue is full */
         if (cur_head - cur_tail >= GPU_QUEUE_SIZE) {
+            __sync_fetch_and_add(&engine->queue_full_events, 1);
             return -1; /* Queue full */
         }
 
@@ -399,12 +412,24 @@ int gpu_engine_submit_and_wait(gpu_engine_t *engine, gpu_work_item_t *item,
         if (++spins > 60000000) { /* 60 million us = 60 sec timeout */
             fprintf(stderr, "gpu_engine_submit_and_wait: timeout polling ticket %lu\n", ticket);
             if (result) result->error_code = -99;
+            __sync_fetch_and_add(&engine->total_poll_spins, spins);
             return -99;
         }
     }
 
+    __sync_fetch_and_add(&engine->total_poll_spins, spins);
+
     if (result) *result = res;
     return res.error_code;
+}
+
+void gpu_engine_get_metrics(gpu_engine_t *engine, gpu_engine_metrics_t *metrics)
+{
+    if (!engine || !metrics) return;
+    metrics->queue_full_events = engine->queue_full_events;
+    metrics->items_submitted   = engine->items_submitted;
+    metrics->items_completed   = engine->items_completed;
+    metrics->total_poll_spins  = engine->total_poll_spins;
 }
 
 const gpu_work_item_t *gpu_engine_get_item(gpu_engine_t *engine,

@@ -46,6 +46,7 @@ add_library(daos_gpu_engine STATIC
     src/gpu_csum.cu
     src/gpu_ec.cu
     src/gpu_mem.cu
+    src/gpu_mempool.cu
     src/gpu_comp.cu
 )
 target_include_directories(daos_gpu_engine PUBLIC
@@ -80,6 +81,7 @@ add_gpu_test(test_error     tests/test_error.cu)
 add_gpu_test(test_latency   tests/test_latency.cu)
 add_gpu_test(test_compress  tests/test_compress.cu)
 add_gpu_test(test_verify_all tests/test_verify_all.cu)
+add_gpu_test(test_mempool    tests/test_mempool.cu)
 
 # ── Benchmarks ───────────────────────────────────────────────────────────
 add_executable(bench_csum     benchmarks/bench_csum.cu)

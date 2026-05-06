@@ -11,13 +11,6 @@ int main(void)
 {
     printf("=== Test LZ4 Compress / Decompress ===\n");
 
-    gpu_engine_t *eng = NULL;
-    int rc = gpu_engine_init(&eng);
-    if (rc != 0) {
-        fprintf(stderr, "Failed to init engine\n");
-        return 1;
-    }
-
     const size_t raw_size = 4096;
     const size_t comp_max_size = 8192; // Max possible size for LZ4
     
@@ -30,12 +23,24 @@ int main(void)
         h_raw[i] = (uint8_t)(i % 16);
     }
 
+    /* Allocate ALL GPU memory BEFORE engine init to avoid deadlock.
+     * cudaMalloc triggers implicit device sync which hangs if the
+     * persistent kernel is already running. */
     void *d_raw, *d_comp, *d_decomp;
     cudaMalloc(&d_raw, raw_size);
     cudaMalloc(&d_comp, comp_max_size);
     cudaMalloc(&d_decomp, raw_size);
 
     cudaMemcpy(d_raw, h_raw, raw_size, cudaMemcpyHostToDevice);
+
+    gpu_engine_t *eng = NULL;
+    int rc = gpu_engine_init(&eng);
+    if (rc != 0) {
+        fprintf(stderr, "Failed to init engine\n");
+        cudaFree(d_raw); cudaFree(d_comp); cudaFree(d_decomp);
+        free(h_raw); free(h_out); free(h_decomp);
+        return 1;
+    }
 
     /* ── Compress ────────────────────────────────────────────── */
     gpu_work_item_t item_comp = {};

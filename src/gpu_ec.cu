@@ -65,6 +65,21 @@ void cpu_ec_xor_parity(const void **data_ptrs, int num_stripes,
     }
 }
 
+/* ── GF(2^8) Arithmetic ────────────────────────────────────────────────── */
+/* Fast parallel GF(2^8) multiplication by 2 using irreducible polynomial 0x11D.
+ * Multiplies four bytes packed into a 32-bit word, executing on uint4 vectors.
+ */
+__device__ __forceinline__ uint4 gf_mul2(uint4 val)
+{
+    uint4 res;
+    uint32_t mask;
+    mask = (val.x & 0x80808080) >> 7; res.x = ((val.x << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
+    mask = (val.y & 0x80808080) >> 7; res.y = ((val.y << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
+    mask = (val.z & 0x80808080) >> 7; res.z = ((val.z << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
+    mask = (val.w & 0x80808080) >> 7; res.w = ((val.w << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
+    return res;
+}
+
 /* ── Cooperative Block EC Parity Generation ────────────────────────────── */
 /* Computes P and Q parity for up to 16 data stripes.
  * Uses 16-byte vectorized loads (uint4) for massive VRAM throughput.
@@ -93,18 +108,18 @@ __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
         }
     }
 
-    /* Q-Parity: Simulated GF(2^8) / Shift XOR for RAID-6 benchmark */
+    /* Q-Parity: GF(2^8) Horner's Method */
     if (parity_cnt >= 2) {
         uint4 *q_out = (uint4*)parity_ptrs[1];
         for (size_t i = threadIdx.x; i < vec_len; i += blockDim.x) {
-            uint4 q_val = ((const uint4*)ec_ptrs[0])[i];
-            for (uint32_t s = 1; s < stripe_cnt; s++) {
+            uint4 q_val = ((const uint4*)ec_ptrs[stripe_cnt - 1])[i];
+            for (int s = (int)stripe_cnt - 2; s >= 0; s--) {
                 uint4 s_val = ((const uint4*)ec_ptrs[s])[i];
-                /* Very simple placeholder GF multiplier (shift/XOR) for benchmarking throughput */
-                q_val.x ^= (s_val.x << 1) ^ s_val.x;
-                q_val.y ^= (s_val.y << 1) ^ s_val.y;
-                q_val.z ^= (s_val.z << 1) ^ s_val.z;
-                q_val.w ^= (s_val.w << 1) ^ s_val.w;
+                q_val = gf_mul2(q_val);
+                q_val.x ^= s_val.x;
+                q_val.y ^= s_val.y;
+                q_val.z ^= s_val.z;
+                q_val.w ^= s_val.w;
             }
             q_out[i] = q_val;
         }

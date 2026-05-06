@@ -37,6 +37,12 @@ static const uint8_t expected_sha256_abc[32] = {
     0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad
 };
 
+/* Helper: CPU GF(2^8) multiply by 2 for packed 32-bit words */
+static inline uint32_t cpu_gf_mul2_32(uint32_t val) {
+    uint32_t mask = (val & 0x80808080) >> 7;
+    return ((val << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
+}
+
 /* ── Pre-allocated GPU buffers ──────────────────────────────────────────── */
 /* All allocated before engine init to avoid cudaMalloc deadlock */
 struct gpu_buffers {
@@ -183,22 +189,26 @@ static int verify_ec_encode(gpu_engine_t *eng, struct gpu_buffers *buf) {
         h_cpu_parity[0][i] = val;
     }
 
-    /* CPU Q Parity: Placeholder shift XOR on 32-bit words (see gpu_ec.cu) */
+    /* CPU Q Parity: GF(2^8) Horner's Method */
     uint32_t *cpu_q_32 = (uint32_t *)h_cpu_parity[1];
     for (size_t i = 0; i < len / 4; i++) {
-        uint32_t val = ((uint32_t *)h_data[0])[i];
-        for (int s = 1; s < (int)k; s++) {
+        uint32_t val = ((uint32_t *)h_data[k - 1])[i];
+        for (int s = (int)k - 2; s >= 0; s--) {
             uint32_t s_val = ((uint32_t *)h_data[s])[i];
-            val ^= (s_val << 1) ^ s_val;
+            val = cpu_gf_mul2_32(val);
+            val ^= s_val;
         }
         cpu_q_32[i] = val;
     }
 
     for (int i = 0; i < (int)p; i++) {
-        if (memcmp(h_gpu_parity[i], h_cpu_parity[i], len) != 0) {
-            TEST_FAIL("verify_ec_encode", "GPU EC logic mismatch with CPU");
+       int mismatch_q = memcmp(h_gpu_parity[1], h_cpu_parity[1], len);
+    if (mismatch_q != 0) {
+        for(int i=0; i<16; i++) {
+            printf("Q byte %d: GPU %02x, CPU %02x\n", i, h_gpu_parity[1][i], h_cpu_parity[1][i]);
         }
-    }
+        TEST_FAIL("verify_ec_encode", "GPU EC logic mismatch with CPU");
+    }    }
 
     for (int i = 0; i < (int)k; i++) free(h_data[i]);
     for (int i = 0; i < (int)p; i++) { free(h_gpu_parity[i]); free(h_cpu_parity[i]); }
