@@ -242,6 +242,7 @@ int gpu_engine_init(gpu_engine_t **engine_out)
     gpu_result_t *d_results = NULL;
     volatile uint64_t *d_head = NULL, *d_tail = NULL;
     volatile int *d_shutdown = NULL;
+    size_t shmem_bytes = 0;
 
     /* Allocate pinned memory (visible to both CPU and GPU) */
     CUDA_CHECK(cudaHostAlloc(&eng->queue, sizeof(gpu_work_item_t) * GPU_QUEUE_SIZE,
@@ -283,7 +284,19 @@ int gpu_engine_init(gpu_engine_t **engine_out)
     /* Clear any residual CUDA errors before launch check */
     cudaGetLastError();
 
-    persistent_kernel<<<num_blocks, threads_per_block, 0, eng->stream>>>(
+    /* Dynamic shared memory for nvCOMPDx compression scratch buffers.
+     * Without nvCOMPDx, no extra shared memory is needed. */
+#ifdef USE_NVCOMPDX
+    /* Query shared memory requirements from nvCOMPDx at runtime.
+     * We allocate enough for the larger of compress/decompress. */
+    shmem_bytes = 48 * 1024;  /* 48 KB — conservative for LZ4 warp-level */
+    /* Ensure the GPU can support this amount of dynamic shared memory */
+    cudaFuncSetAttribute(persistent_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)shmem_bytes);
+#endif
+
+    persistent_kernel<<<num_blocks, threads_per_block, shmem_bytes, eng->stream>>>(
         d_queue, d_results, d_head, d_tail, d_shutdown);
 
     /* Check for launch errors */

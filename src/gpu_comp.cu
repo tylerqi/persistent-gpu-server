@@ -1,5 +1,13 @@
 /**
- * gpu_comp.cu — LZ4 Compression and Decompression using NVIDIA nvCOMPDx
+ * gpu_comp.cu — LZ4 Compression and Decompression
+ *
+ * When USE_NVCOMPDX is defined (nvCOMPDx / MathDx installed):
+ *   Uses NVIDIA's nvCOMPDx library for real device-side LZ4 compression.
+ *   The compressor/decompressor operates at warp level within the persistent
+ *   kernel's thread block.
+ *
+ * When USE_NVCOMPDX is NOT defined:
+ *   Falls back to vectorized memcpy stubs (1:1 ratio, no actual compression).
  */
 #include "gpu_engine.h"
 #include <cuda_runtime.h>
@@ -7,64 +15,112 @@
 
 #ifdef USE_NVCOMPDX
 #include <nvcompdx.hpp>
-#include <cooperative_groups.h>
 
-namespace cg = cooperative_groups;
+using namespace nvcompdx;
 
-/* Define the nvCOMPDx operator types for Block-level LZ4 */
-using LZ4Compressor = nvcompdx::Compressor<
-    nvcompdx::algorithm::LZ4,
-    nvcompdx::execution::Block,
-    uint8_t
->;
+/* nvCOMPDx LZ4 compressor/decompressor descriptors for sm_75 (Turing).
+ * MaxUncompChunkSize = 1<<20 (1MB) — our largest single-chunk size.
+ * Uses Warp-level execution to fit within the persistent kernel's block. */
+using LZ4CompDesc = decltype(
+    Algorithm<algorithm::lz4>() +
+    DataType<datatype::uint8>() +
+    Direction<direction::compress>() +
+    MaxUncompChunkSize<(1 << 20)>() +  /* 1 MB max chunk */
+    Warp() +
+    SM<750>()
+);
 
-using LZ4Decompressor = nvcompdx::Decompressor<
-    nvcompdx::algorithm::LZ4,
-    nvcompdx::execution::Block,
-    uint8_t
->;
+using LZ4DecompDesc = decltype(
+    Algorithm<algorithm::lz4>() +
+    DataType<datatype::uint8>() +
+    Direction<direction::decompress>() +
+    Warp() +
+    SM<750>()
+);
 
 extern "C" {
-/* Device-side compression using nvCOMPDx block-cooperative execution */
+
+/**
+ * Device-side LZ4 compression using nvCOMPDx.
+ * Called from the persistent kernel — a single warp within the block executes this.
+ * Requires shared memory and a global scratch buffer.
+ *
+ * NOTE: The caller (persistent kernel) must allocate:
+ *   - Shared memory: LZ4CompDesc::shmem_size_group() bytes (aligned)
+ *   - Global scratch: pre-allocated per-block temp buffer
+ */
 __device__ void device_compress_lz4(const uint8_t *in_data, size_t in_len,
                                     uint8_t *out_data, size_t out_max,
                                     size_t *actual_out_size)
 {
-    cg::thread_block block = cg::this_thread_block();
-    
-    // Shared memory for nvCOMP workspace
-    __shared__ uint8_t workspace[LZ4Compressor::shared_memory_size];
-    
-    LZ4Compressor comp(workspace);
-    
-    // Compress
-    size_t written = 0;
-    comp.execute(block, in_data, in_len, out_data, out_max, &written);
-    
-    if (block.thread_rank() == 0) {
-        *actual_out_size = written;
+    /* Only the first warp in the block executes compression.
+     * nvCOMPDx warp-level API requires exactly one warp. */
+    if (threadIdx.x >= 32) {
+        __syncthreads();
+        return;
     }
+
+    /* For data larger than MaxUncompChunkSize, fall back to memcpy */
+    if (in_len > (1 << 20)) {
+        if (threadIdx.x == 0) {
+            size_t copy_len = (in_len < out_max) ? in_len : out_max;
+            /* Simple byte copy for oversized data */
+            for (size_t i = 0; i < copy_len; i++) {
+                out_data[i] = in_data[i];
+            }
+            *actual_out_size = copy_len;
+        }
+        __syncwarp();
+        return;
+    }
+
+    auto compressor = LZ4CompDesc();
+
+    /* Use dynamic shared memory for scratch — the persistent kernel
+     * allocates this based on the SM's available shared memory. */
+    extern __shared__ uint8_t comp_shared_scratch[];
+
+    /* nvCOMPDx LZ4 in warp mode does not need global temp memory
+     * for a single chunk. Pass nullptr. */
+    compressor.execute(
+        in_data,            /* input (uncompressed) */
+        out_data,           /* output (compressed) */
+        in_len,             /* input size */
+        actual_out_size,    /* output size (written by API) */
+        comp_shared_scratch,/* shared memory scratch */
+        nullptr             /* global temp (not needed for single-chunk warp) */
+    );
+    __syncwarp();
 }
 
-/* Device-side decompression using nvCOMPDx block-cooperative execution */
+/**
+ * Device-side LZ4 decompression using nvCOMPDx.
+ */
 __device__ void device_decompress_lz4(const uint8_t *in_data, size_t in_len,
                                       uint8_t *out_data, size_t out_max,
                                       size_t *actual_out_size)
 {
-    cg::thread_block block = cg::this_thread_block();
-    
-    __shared__ uint8_t workspace[LZ4Decompressor::shared_memory_size];
-    
-    LZ4Decompressor decomp(workspace);
-    
-    size_t written = 0;
-    decomp.execute(block, in_data, in_len, out_data, out_max, &written);
-    
-    if (block.thread_rank() == 0) {
-        *actual_out_size = written;
+    if (threadIdx.x >= 32) {
+        __syncthreads();
+        return;
     }
+
+    auto decompressor = LZ4DecompDesc();
+
+    extern __shared__ uint8_t comp_shared_scratch[];
+
+    decompressor.execute(
+        in_data,            /* input (compressed) */
+        out_data,           /* output (decompressed) */
+        in_len,             /* compressed input size */
+        actual_out_size,    /* decompressed output size */
+        comp_shared_scratch,/* shared memory scratch */
+        nullptr             /* global temp */
+    );
+    __syncwarp();
 }
-}
+
+} /* extern "C" */
 
 #else /* USE_NVCOMPDX */
 
