@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * CRC32C (Castagnoli) — iSCSI polynomial 0x1EDC6F41
@@ -14,11 +15,12 @@
  * Non-static: required for cudaMemcpyToSymbol with CUDA_SEPARABLE_COMPILATION */
 __constant__ uint32_t crc32c_table[256];
 static uint32_t h_crc32c_table[256];
-static bool crc32c_table_initialized = false;
 
-static void init_crc32c_table(void)
+/* Thread-safe init using pthread_once (H-3) */
+static pthread_once_t crc32c_init_once = PTHREAD_ONCE_INIT;
+
+static void do_init_crc32c_table(void)
 {
-    if (crc32c_table_initialized) return;
     const uint32_t poly = 0x82F63B78u; /* Bit-reversed CRC32C polynomial */
     for (int i = 0; i < 256; i++) {
         uint32_t crc = (uint32_t)i;
@@ -29,11 +31,17 @@ static void init_crc32c_table(void)
     }
     cudaError_t err = cudaMemcpyToSymbol(crc32c_table, h_crc32c_table, sizeof(h_crc32c_table));
     if (err != cudaSuccess) {
-        /* Symbol may not be resolvable in separable compilation.
-         * Clear the error so it doesn't poison subsequent CUDA calls. */
-        cudaGetLastError(); /* consume and discard */
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(crc32c_table) failed: %s\n"
+                        "  CRC32C computations will produce WRONG results!\n",
+                cudaGetErrorString(err));
+        cudaGetLastError(); /* consume error so it doesn't poison subsequent calls */
     }
-    crc32c_table_initialized = true;
+}
+
+static int init_crc32c_table(void)
+{
+    pthread_once(&crc32c_init_once, do_init_crc32c_table);
+    return 0;
 }
 
 /* Device-side CRC32C — called by persistent kernel */
@@ -41,25 +49,30 @@ __device__ uint32_t device_crc32c(const uint8_t *data, size_t len)
 {
     uint32_t crc = 0xFFFFFFFF;
     
-    /* Vectorized load for bulk data */
     size_t i = 0;
-    const uint4 *data_u4 = (const uint4 *)data;
-    size_t len_u4 = len / 16;
-    
-    for (size_t j = 0; j < len_u4; j++) {
-        uint4 val = data_u4[j];
+
+    /* Only use vectorized loads if data is 16-byte aligned */
+    if (((uintptr_t)data & 0xF) == 0) {
+        const uint4 *data_u4 = (const uint4 *)data;
+        size_t len_u4 = len / 16;
         
-        /* Process 16 bytes sequentially but loaded in one 128-bit transaction */
-        uint8_t *bytes = (uint8_t *)&val;
-        #pragma unroll
-        for (int k = 0; k < 16; k++) {
-            uint8_t idx = (uint8_t)((crc ^ bytes[k]) & 0xFF);
-            crc = (crc >> 8) ^ crc32c_table[idx];
+        for (size_t j = 0; j < len_u4; j++) {
+            uint4 val = data_u4[j];
+            
+            /* Process 16 bytes sequentially but loaded in one 128-bit transaction */
+            uint8_t *bytes = (uint8_t *)&val;
+            #pragma unroll
+            for (int k = 0; k < 16; k++) {
+                uint8_t idx = (uint8_t)((crc ^ bytes[k]) & 0xFF);
+                crc = (crc >> 8) ^ crc32c_table[idx];
+            }
         }
+        
+        i = len_u4 * 16;
     }
     
-    /* Tail bytes */
-    for (i = len_u4 * 16; i < len; i++) {
+    /* Tail bytes (or all bytes if unaligned) */
+    for (; i < len; i++) {
         uint8_t idx = (uint8_t)((crc ^ data[i]) & 0xFF);
         crc = (crc >> 8) ^ crc32c_table[idx];
     }
@@ -100,27 +113,30 @@ void gpu_csum_init(void)
 }
 
 /* CPU reference CRC32C for verification */
+static uint32_t cpu_crc32c_table[256];
+static pthread_once_t cpu_crc32c_init_once = PTHREAD_ONCE_INIT;
+
+static void do_init_cpu_crc32c_table(void)
+{
+    const uint32_t poly = 0x82F63B78u;
+    for (int i = 0; i < 256; i++) {
+        uint32_t crc = (uint32_t)i;
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
+        }
+        cpu_crc32c_table[i] = crc;
+    }
+}
+
 uint32_t cpu_crc32c(const void *data, size_t len)
 {
-    /* Initialize table if needed (same algorithm as GPU) */
-    const uint32_t poly = 0x82F63B78u;
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (int i = 0; i < 256; i++) {
-            uint32_t crc = (uint32_t)i;
-            for (int j = 0; j < 8; j++) {
-                crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
-            }
-            table[i] = crc;
-        }
-        init = true;
-    }
+    /* Thread-safe one-time table init (H-4) */
+    pthread_once(&cpu_crc32c_init_once, do_init_cpu_crc32c_table);
 
     const uint8_t *p = (const uint8_t *)data;
     uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < len; i++) {
-        crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFF];
+        crc = (crc >> 8) ^ cpu_crc32c_table[(crc ^ p[i]) & 0xFF];
     }
     return crc ^ 0xFFFFFFFF;
 }

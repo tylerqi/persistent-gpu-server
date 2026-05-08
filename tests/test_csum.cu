@@ -138,8 +138,8 @@ static int test_sha256_known(void)
     return 0;
 }
 
-/* Test SHA256: empty string */
-static int test_sha256_empty(void)
+/* Test SHA256: single zero byte (gpu_sha256 rejects len=0) */
+static int test_sha256_single_byte(void)
 {
     /* SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 */
     uint8_t expected[32] = {
@@ -179,7 +179,7 @@ int main(void)
     failures += test_crc32c_sizes();
     failures += test_crc32c_zeros();
     failures += test_sha256_known();
-    failures += test_sha256_empty();
+    failures += test_sha256_single_byte();
     printf("=== %s (%d failures) ===\n", failures ? "FAILED" : "PASSED", failures);
     return failures;
 }

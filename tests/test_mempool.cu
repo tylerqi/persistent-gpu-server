@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <thread>
 #include <vector>
+#include <set>
 
 #define TEST_PASS(name) printf("  [PASS] %s\n", name)
 #define TEST_FAIL(name, msg) do { printf("  [FAIL] %s: %s\n", name, msg); return 1; } while(0)
@@ -58,14 +59,24 @@ int test_concurrent_alloc(void) {
 
     for (auto& t : threads) t.join();
 
-    // Verify all pointers are valid and unique
+    // Verify all pointers are valid and unique (M-5)
+    std::set<void*> unique_ptrs;
     int valid_count = 0;
     for (int t = 0; t < num_threads; t++) {
         for (void *ptr : results[t]) {
-            if (ptr != NULL) valid_count++;
+            if (ptr != NULL) {
+                valid_count++;
+                unique_ptrs.insert(ptr);
+            }
         }
     }
     if (valid_count != num_blocks) TEST_FAIL("concurrent_alloc", "did not allocate all blocks");
+    if ((int)unique_ptrs.size() != num_blocks) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "duplicate pointers detected: %d unique out of %d",
+                 (int)unique_ptrs.size(), num_blocks);
+        TEST_FAIL("concurrent_alloc", msg);
+    }
 
     // Free everything concurrently
     threads.clear();

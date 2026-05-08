@@ -37,10 +37,11 @@ static const uint8_t expected_sha256_abc[32] = {
     0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad
 };
 
-/* Helper: CPU GF(2^8) multiply by 2 for packed 32-bit words */
+/* Helper: CPU GF(2^8) multiply by 2 for packed 32-bit words.
+ * Uses polynomial 0x11B (reduction constant 0x1B) — ISA-L compatible. */
 static inline uint32_t cpu_gf_mul2_32(uint32_t val) {
     uint32_t mask = (val & 0x80808080) >> 7;
-    return ((val << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
+    return ((val << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
 }
 
 /* ── Pre-allocated GPU buffers ──────────────────────────────────────────── */
@@ -201,14 +202,18 @@ static int verify_ec_encode(gpu_engine_t *eng, struct gpu_buffers *buf) {
         cpu_q_32[i] = val;
     }
 
-    for (int i = 0; i < (int)p; i++) {
-       int mismatch_q = memcmp(h_gpu_parity[1], h_cpu_parity[1], len);
-    if (mismatch_q != 0) {
-        for(int i=0; i<16; i++) {
-            printf("Q byte %d: GPU %02x, CPU %02x\n", i, h_gpu_parity[1][i], h_cpu_parity[1][i]);
+    /* Verify both P and Q parity against CPU reference */
+    for (int pi = 0; pi < (int)p; pi++) {
+        int mismatch = memcmp(h_gpu_parity[pi], h_cpu_parity[pi], len);
+        if (mismatch != 0) {
+            const char *label = (pi == 0) ? "P" : "Q";
+            for (int j = 0; j < 16; j++) {
+                printf("%s byte %d: GPU %02x, CPU %02x\n", label, j,
+                       h_gpu_parity[pi][j], h_cpu_parity[pi][j]);
+            }
+            TEST_FAIL("verify_ec_encode", "GPU EC parity mismatch with CPU");
         }
-        TEST_FAIL("verify_ec_encode", "GPU EC logic mismatch with CPU");
-    }    }
+    }
 
     for (int i = 0; i < (int)k; i++) free(h_data[i]);
     for (int i = 0; i < (int)p; i++) { free(h_gpu_parity[i]); free(h_cpu_parity[i]); }

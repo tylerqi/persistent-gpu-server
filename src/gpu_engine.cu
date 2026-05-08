@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sched.h>
 
 /* ── Forward declarations of device-side compute functions ─────────────── */
 __device__ uint32_t device_crc32c(const uint8_t *data, size_t len);
@@ -80,10 +81,10 @@ __global__ void persistent_kernel(
 
         uint64_t my_tail = shared_tail;
         if (my_tail == (uint64_t)-1) {
-            /* No work available or failed claim — sleep */
+            /* No work available or failed claim — progressive backoff sleep */
             if (tid == 0) {
 #if __CUDA_ARCH__ >= 700
-                __nanosleep(100);
+                __nanosleep(1000); /* 1µs — reduces PCIe coherence storm */
 #endif
             }
             __syncthreads();
@@ -97,10 +98,13 @@ __global__ void persistent_kernel(
 
         /* Wait until CPU has fully written the item */
         if (tid == 0) {
+            int wait_spins = 0;
             while (item->op_type == GPU_OP_INVALID && !(*shutdown)) {
 #if __CUDA_ARCH__ >= 700
-                __nanosleep(10);
+                /* Progressive backoff: 100ns → 1µs as item takes longer to arrive */
+                __nanosleep(wait_spins < 100 ? 100 : 1000);
 #endif
+                wait_spins++;
             }
         }
         __syncthreads();
@@ -138,16 +142,19 @@ __global__ void persistent_kernel(
                 if (s_item.data_ptr == NULL || s_item.data_len == 0) {
                     result->error_code = GPU_ERR_INVAL;
                 } else {
-                    /* Write SHA256 result to result slot (unified API) */
+                    /* Write SHA256 result via temp buffer to avoid stripping volatile (H-5) */
+                    uint8_t sha_tmp[32];
                     device_sha256((const uint8_t *)s_item.data_ptr,
-                                  s_item.data_len, (uint8_t *)result->sha256_result);
+                                  s_item.data_len, sha_tmp);
+                    for (int si = 0; si < 32; si++)
+                        result->sha256_result[si] = sha_tmp[si];
                 }
             }
             break;
 
         case GPU_OP_EC_ENCODE:
-        case GPU_OP_EC_DECODE:
-            if (s_item.stripe_cnt == 0 || s_item.cell_size == 0) {
+            if (s_item.stripe_cnt == 0 || s_item.cell_size == 0 ||
+                s_item.stripe_cnt > 16 || s_item.parity_cnt > 4) {
                 if (tid == 0) result->error_code = GPU_ERR_INVAL;
             } else {
                 device_ec_encode((void *const *)s_item.ec_ptrs,
@@ -155,6 +162,11 @@ __global__ void persistent_kernel(
                                  s_item.stripe_cnt, s_item.parity_cnt,
                                  s_item.cell_size);
             }
+            break;
+
+        case GPU_OP_EC_DECODE:
+            /* EC decode (data reconstruction) is not yet implemented (C-2) */
+            if (tid == 0) result->error_code = GPU_ERR_NOSYS;
             break;
 
         case GPU_OP_COMPRESS_LZ4:
@@ -188,18 +200,12 @@ __global__ void persistent_kernel(
         __syncthreads();
 
         /* ── Mark result as ready (visible to CPU) ────────────────── */
-        if (s_item.op_type == GPU_OP_COMPRESS_LZ4 || s_item.op_type == GPU_OP_DECOMPRESS_LZ4 ||
-            s_item.op_type == GPU_OP_EC_ENCODE    || s_item.op_type == GPU_OP_EC_DECODE) {
-            __threadfence_system();
-        }
-        __syncthreads();
-
         if (tid == 0) {
             result->ticket = my_tail; /* Generation counter */
             item->op_type = GPU_OP_INVALID; /* Free slot for next use */
-            __threadfence_system();
+            __threadfence_system(); /* Ensure all result fields visible before READY */
             result->status = GPU_RESULT_READY;
-            __threadfence_system();
+            __threadfence_system(); /* Ensure READY is visible to CPU */
         }
         __syncthreads();
     }
@@ -208,11 +214,11 @@ __global__ void persistent_kernel(
 /* ── Host API ──────────────────────────────────────────────────────────── */
 
 #define CUDA_CHECK(call) do {                                   \
-    cudaError_t err = (call);                                   \
-    if (err != cudaSuccess) {                                   \
+    cudaError_t _err = (call);                                  \
+    if (_err != cudaSuccess) {                                  \
         fprintf(stderr, "CUDA error at %s:%d: %s\n",           \
-                __FILE__, __LINE__, cudaGetErrorString(err));   \
-        return -1;                                              \
+                __FILE__, __LINE__, cudaGetErrorString(_err));  \
+        goto init_cleanup;                                      \
     }                                                           \
 } while(0)
 
@@ -225,6 +231,17 @@ int gpu_engine_init(gpu_engine_t **engine_out)
 
     gpu_engine_t *eng = (gpu_engine_t *)calloc(1, sizeof(gpu_engine_t));
     if (!eng) return -1;
+
+    /* Pre-declare ALL variables before first CUDA_CHECK to allow goto cleanup
+     * in C++ (goto cannot jump over variable declarations with initializers). */
+    int device = 0;
+    cudaDeviceProp prop;
+    int num_blocks = 0;
+    int threads_per_block = 128;
+    gpu_work_item_t *d_queue = NULL;
+    gpu_result_t *d_results = NULL;
+    volatile uint64_t *d_head = NULL, *d_tail = NULL;
+    volatile int *d_shutdown = NULL;
 
     /* Allocate pinned memory (visible to both CPU and GPU) */
     CUDA_CHECK(cudaHostAlloc(&eng->queue, sizeof(gpu_work_item_t) * GPU_QUEUE_SIZE,
@@ -249,22 +266,14 @@ int gpu_engine_init(gpu_engine_t **engine_out)
     CUDA_CHECK(cudaStreamCreateWithFlags(&eng->stream, cudaStreamNonBlocking));
 
     /* Get device SM count for optimal launch */
-    int device;
     CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
-    /* Launch with enough blocks to saturate all SMs. 
-     * RTX Pro 6000 has 142 SMs. Launching 2 blocks per SM gives massive concurrent throughput. */
-    int num_blocks = prop.multiProcessorCount * 2;
-    int threads_per_block = 128; /* Increased to 128 threads for block-cooperative execution */
+    /* Launch 1 block per SM — balances throughput vs. polling overhead (H-7).
+     * Each block has 128 threads for cooperative EC/compress execution. */
+    num_blocks = prop.multiProcessorCount;
 
     /* Get device pointers for mapped memory */
-    gpu_work_item_t *d_queue;
-    gpu_result_t *d_results;
-    volatile uint64_t *d_head, *d_tail;
-    volatile int *d_shutdown;
-
     CUDA_CHECK(cudaHostGetDevicePointer(&d_queue, eng->queue, 0));
     CUDA_CHECK(cudaHostGetDevicePointer(&d_results, eng->results, 0));
     CUDA_CHECK(cudaHostGetDevicePointer((uint64_t **)&d_head, (void *)eng->head, 0));
@@ -278,15 +287,22 @@ int gpu_engine_init(gpu_engine_t **engine_out)
         d_queue, d_results, d_head, d_tail, d_shutdown);
 
     /* Check for launch errors */
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(err));
-        gpu_engine_fini(eng);
-        return -1;
+    {
+        cudaError_t launch_err = cudaGetLastError();
+        if (launch_err != cudaSuccess) {
+            fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(launch_err));
+            gpu_engine_fini(eng);
+            return -1;
+        }
     }
 
     *engine_out = eng;
     return 0;
+
+init_cleanup:
+    /* Resource cleanup on CUDA_CHECK failure (C-5) */
+    gpu_engine_fini(eng);
+    return -1;
 }
 
 void gpu_engine_fini(gpu_engine_t *engine)
@@ -318,7 +334,11 @@ void gpu_engine_fini(gpu_engine_t *engine)
 int gpu_engine_submit(gpu_engine_t *engine, const gpu_work_item_t *item,
                       uint64_t *ticket_out)
 {
-    if (!engine || !item || !ticket_out) return -1;
+    if (!engine || !item || !ticket_out) return GPU_ERR_INVAL;
+
+    /* Validate op_type on CPU side before queue round-trip (L-6) */
+    if (item->op_type <= GPU_OP_INVALID || item->op_type >= GPU_OP_MAX)
+        return GPU_ERR_INVAL;
 
     /* CAS loop to atomically claim a slot only if there is room.
      * This avoids the old __sync_fetch_and_sub rollback race (BUG-1). */
@@ -330,7 +350,7 @@ int gpu_engine_submit(gpu_engine_t *engine, const gpu_work_item_t *item,
         /* Check if queue is full */
         if (cur_head - cur_tail >= GPU_QUEUE_SIZE) {
             __sync_fetch_and_add(&engine->queue_full_events, 1);
-            return -1; /* Queue full */
+            return GPU_ERR_QUEUE_FULL; /* Distinct from invalid args (M-3) */
         }
 
         /* Attempt to claim this slot */
@@ -341,6 +361,8 @@ int gpu_engine_submit(gpu_engine_t *engine, const gpu_work_item_t *item,
         }
         /* CAS failed — another thread claimed it, retry */
     }
+
+    __sync_fetch_and_add(&engine->items_submitted, 1);
 
     uint32_t slot = (uint32_t)(ticket & GPU_QUEUE_MASK);
 
@@ -392,6 +414,13 @@ int gpu_engine_poll(gpu_engine_t *engine, uint64_t ticket,
         result->ticket = r->ticket;
     }
 
+    /* Only count first poll per ticket — CAS prevents double-counting (H-1).
+     * We mark the slot as "reaped" by clearing the status back to PENDING. */
+    if (__sync_bool_compare_and_swap((volatile int32_t *)&r->status,
+                                     (int32_t)GPU_RESULT_READY,
+                                     (int32_t)GPU_RESULT_PENDING)) {
+        __sync_fetch_and_add(&engine->items_completed, 1);
+    }
     return 1; /* Ready */
 }
 
@@ -402,18 +431,34 @@ int gpu_engine_submit_and_wait(gpu_engine_t *engine, gpu_work_item_t *item,
     int rc = gpu_engine_submit(engine, item, &ticket);
     if (rc != 0) return rc;
 
-    /* Spin-poll for completion with timeout */
+    /* Spin-poll for completion with adaptive backoff:
+     *   Phase 1 (spins 0-1000):   pure spin with CPU PAUSE hint
+     *   Phase 2 (spins 1000-5000): sched_yield() to let other threads run
+     *   Phase 3 (spins 5000+):     usleep(10) for long-running ops (1MB CRC, EC)
+     */
     gpu_result_t res;
     int spins = 0;
     while (gpu_engine_poll(engine, ticket, &res) == 0) {
-        /* Backoff to prevent PCIe livelock */
-        usleep(1);
-        
-        if (++spins > 60000000) { /* 60 million us = 60 sec timeout */
+        if (spins < 1000) {
+            /* Phase 1: tight spin with CPU pause hint to reduce power/contention */
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#endif
+        } else if (spins < 5000) {
+            /* Phase 2: yield to OS scheduler */
+            sched_yield();
+        } else {
+            /* Phase 3: sleep for long-running operations */
+            usleep(10);
+        }
+
+        if (++spins > 6000000) { /* ~60 sec timeout */
             fprintf(stderr, "gpu_engine_submit_and_wait: timeout polling ticket %lu\n", ticket);
-            if (result) result->error_code = -99;
+            if (result) result->error_code = GPU_ERR_TIMEOUT;
             __sync_fetch_and_add(&engine->total_poll_spins, spins);
-            return -99;
+            return GPU_ERR_TIMEOUT;
         }
     }
 
@@ -444,12 +489,15 @@ const gpu_work_item_t *gpu_engine_get_item(gpu_engine_t *engine,
 const char *gpu_error_string(int32_t code)
 {
     switch (code) {
-    case GPU_SUCCESS:      return "success";
-    case GPU_ERR_INVAL:    return "invalid argument";
-    case GPU_ERR_NOMEM:    return "out of memory";
-    case GPU_ERR_IO:       return "I/O error";
-    case GPU_ERR_OVERFLOW: return "buffer overflow";
-    case GPU_ERR_CSUM:     return "checksum mismatch";
-    default:               return "unknown error";
+    case GPU_SUCCESS:        return "success";
+    case GPU_ERR_INVAL:      return "invalid argument";
+    case GPU_ERR_NOMEM:      return "out of memory";
+    case GPU_ERR_IO:         return "I/O error";
+    case GPU_ERR_OVERFLOW:   return "buffer overflow";
+    case GPU_ERR_CSUM:       return "checksum mismatch";
+    case GPU_ERR_TIMEOUT:    return "operation timed out";
+    case GPU_ERR_QUEUE_FULL: return "work queue full";
+    case GPU_ERR_NOSYS:      return "not implemented";
+    default:                 return "unknown error";
     }
 }

@@ -21,6 +21,9 @@ extern "C" {
 #define GPU_ERR_IO         -1003   /* I/O error */
 #define GPU_ERR_OVERFLOW   -1004   /* Buffer overflow */
 #define GPU_ERR_CSUM       -1005   /* Checksum mismatch */
+#define GPU_ERR_TIMEOUT    -1006   /* Operation timed out */
+#define GPU_ERR_QUEUE_FULL -1007   /* Work queue is full, try again */
+#define GPU_ERR_NOSYS      -1008   /* Operation not implemented */
 #define GPU_ERR_UNKNOWN    -1099   /* Unknown error */
 
 #ifdef __CUDACC__

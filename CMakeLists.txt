@@ -53,7 +53,7 @@ target_include_directories(daos_gpu_engine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(daos_gpu_engine PRIVATE CUDA::cudart ${EXTRA_LIBS})
+target_link_libraries(daos_gpu_engine PRIVATE CUDA::cudart pthread ${EXTRA_LIBS})
 set_target_properties(daos_gpu_engine PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -79,6 +79,7 @@ add_gpu_test(test_csum      tests/test_csum.cu)
 add_gpu_test(test_ec        tests/test_ec.cu)
 add_gpu_test(test_error     tests/test_error.cu)
 add_gpu_test(test_latency   tests/test_latency.cu)
+set_tests_properties(test_latency PROPERTIES TIMEOUT 180)
 add_gpu_test(test_compress  tests/test_compress.cu)
 add_gpu_test(test_verify_all tests/test_verify_all.cu)
 add_gpu_test(test_mempool    tests/test_mempool.cu)

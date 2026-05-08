@@ -43,10 +43,16 @@ int gpu_ec_xor_parity(void **data_ptrs, int num_stripes, size_t stripe_len,
     int threads = 256;
     int blocks = (int)((stripe_len + threads - 1) / threads);
 
-    ec_xor_parity_kernel<<<blocks, threads>>>(
+    /* Use a dedicated stream instead of cudaDeviceSynchronize() to avoid
+     * deadlocking with the persistent kernel running on another stream. */
+    cudaStream_t stream;
+    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+    ec_xor_parity_kernel<<<blocks, threads, 0, stream>>>(
         d_ptrs, num_stripes, stripe_len, (uint8_t *)parity_out);
 
-    cudaDeviceSynchronize();
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
     cudaFree(d_ptrs);
     return 0;
 }
@@ -66,23 +72,32 @@ void cpu_ec_xor_parity(const void **data_ptrs, int num_stripes,
 }
 
 /* ── GF(2^8) Arithmetic ────────────────────────────────────────────────── */
-/* Fast parallel GF(2^8) multiplication by 2 using irreducible polynomial 0x11D.
+/* Fast parallel GF(2^8) multiplication by 2 using irreducible polynomial 0x11B.
+ * This is the standard polynomial used by ISA-L, DAOS, and Linux RAID-6.
+ * Reduction constant = 0x1B (lower 8 bits of 0x11B).
  * Multiplies four bytes packed into a 32-bit word, executing on uint4 vectors.
  */
 __device__ __forceinline__ uint4 gf_mul2(uint4 val)
 {
     uint4 res;
     uint32_t mask;
-    mask = (val.x & 0x80808080) >> 7; res.x = ((val.x << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
-    mask = (val.y & 0x80808080) >> 7; res.y = ((val.y << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
-    mask = (val.z & 0x80808080) >> 7; res.z = ((val.z << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
-    mask = (val.w & 0x80808080) >> 7; res.w = ((val.w << 1) & 0xFEFEFEFE) ^ (mask * 0x1D);
+    mask = (val.x & 0x80808080) >> 7; res.x = ((val.x << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
+    mask = (val.y & 0x80808080) >> 7; res.y = ((val.y << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
+    mask = (val.z & 0x80808080) >> 7; res.z = ((val.z << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
+    mask = (val.w & 0x80808080) >> 7; res.w = ((val.w << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
     return res;
+}
+
+/* Scalar GF(2^8) multiply by 2 for tail bytes */
+__device__ __forceinline__ uint8_t gf_mul2_byte(uint8_t val)
+{
+    return (uint8_t)(((val << 1) & 0xFE) ^ ((val >> 7) * 0x1B));
 }
 
 /* ── Cooperative Block EC Parity Generation ────────────────────────────── */
 /* Computes P and Q parity for up to 16 data stripes.
  * Uses 16-byte vectorized loads (uint4) for massive VRAM throughput.
+ * Handles non-16-aligned cell sizes with a scalar tail loop (C-3 fix).
  */
 __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
                                  uint32_t stripe_cnt, uint32_t parity_cnt,
@@ -91,10 +106,13 @@ __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
     if (stripe_cnt == 0 || parity_cnt == 0 || cell_size == 0) return;
 
     size_t vec_len = cell_size / sizeof(uint4);
+    size_t tail_start = vec_len * sizeof(uint4); /* Byte offset where tail begins */
+    size_t tail_len = cell_size - tail_start;     /* 0..15 bytes */
 
     /* P-Parity: Simple XOR */
     if (parity_cnt >= 1) {
         uint4 *p_out = (uint4*)parity_ptrs[0];
+        /* Vectorized main loop */
         for (size_t i = threadIdx.x; i < vec_len; i += blockDim.x) {
             uint4 p_val = ((const uint4*)ec_ptrs[0])[i];
             for (uint32_t s = 1; s < stripe_cnt; s++) {
@@ -106,11 +124,21 @@ __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
             }
             p_out[i] = p_val;
         }
+        /* Scalar tail for non-16-aligned cell_size (C-3) */
+        uint8_t *p_out_bytes = (uint8_t*)parity_ptrs[0];
+        for (size_t i = tail_start + threadIdx.x; i < cell_size; i += blockDim.x) {
+            uint8_t p_byte = ((const uint8_t*)ec_ptrs[0])[i];
+            for (uint32_t s = 1; s < stripe_cnt; s++) {
+                p_byte ^= ((const uint8_t*)ec_ptrs[s])[i];
+            }
+            p_out_bytes[i] = p_byte;
+        }
     }
 
     /* Q-Parity: GF(2^8) Horner's Method */
     if (parity_cnt >= 2) {
         uint4 *q_out = (uint4*)parity_ptrs[1];
+        /* Vectorized main loop */
         for (size_t i = threadIdx.x; i < vec_len; i += blockDim.x) {
             uint4 q_val = ((const uint4*)ec_ptrs[stripe_cnt - 1])[i];
             for (int s = (int)stripe_cnt - 2; s >= 0; s--) {
@@ -122,6 +150,16 @@ __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
                 q_val.w ^= s_val.w;
             }
             q_out[i] = q_val;
+        }
+        /* Scalar tail for non-16-aligned cell_size (C-3) */
+        uint8_t *q_out_bytes = (uint8_t*)parity_ptrs[1];
+        for (size_t i = tail_start + threadIdx.x; i < cell_size; i += blockDim.x) {
+            uint8_t q_byte = ((const uint8_t*)ec_ptrs[stripe_cnt - 1])[i];
+            for (int s = (int)stripe_cnt - 2; s >= 0; s--) {
+                q_byte = gf_mul2_byte(q_byte);
+                q_byte ^= ((const uint8_t*)ec_ptrs[s])[i];
+            }
+            q_out_bytes[i] = q_byte;
         }
     }
 }

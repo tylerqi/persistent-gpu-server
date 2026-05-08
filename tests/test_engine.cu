@@ -2,6 +2,7 @@
  * test_engine.cu — Unit test: persistent kernel launch, work dispatch, shutdown
  */
 #include "gpu_engine.h"
+#include "gpu_csum.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,8 +130,17 @@ static int test_engine_crc32c(void)
         TEST_FAIL("engine_crc32c", "Kernel crashed");
     }
 
-    /* Read CRC result from the queue item */
-    /* Note: result is in the queue's item slot, not in the result struct */
+    /* Verify CRC result against CPU reference (M-4) */
+    uint32_t gpu_crc = result.crc32c_result;
+    uint32_t cpu_crc = cpu_crc32c(h_data, len);
+    if (gpu_crc != cpu_crc) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "CRC mismatch: GPU=0x%08X CPU=0x%08X", gpu_crc, cpu_crc);
+        gpu_engine_fini(eng);
+        cudaFree(d_data);
+        free(h_data);
+        TEST_FAIL("engine_crc32c", msg);
+    }
 
     gpu_engine_fini(eng);
     cudaFree(d_data);

@@ -69,26 +69,35 @@ __device__ void device_decompress_lz4(const uint8_t *in_data, size_t in_len,
 #else /* USE_NVCOMPDX */
 
 extern "C" {
-/* Stubs if nvCOMPDx (MathDx) is not installed */
+/* Stubs if nvCOMPDx (MathDx) is not installed.
+ * WARNING: These stubs perform a memcpy (no actual compression).
+ * Compression ratio will be 1:1. Enable USE_NVCOMPDX for real LZ4. */
 __device__ void device_compress_lz4(const uint8_t *in_data, size_t in_len,
                                     uint8_t *out_data, size_t out_max,
                                     size_t *actual_out_size)
 {
-    /* Fallback stub: vectorized uint4 memory copy to simulate high-bandwidth pass-through */
+    /* Fallback stub: memory copy (no compression) */
     size_t copy_len = (in_len < out_max) ? in_len : out_max;
-    size_t copy_len_uint4 = copy_len / 16;
-    
-    uint4 *out_4 = (uint4 *)out_data;
-    const uint4 *in_4 = (const uint4 *)in_data;
-    
-    for (size_t i = threadIdx.x; i < copy_len_uint4; i += blockDim.x) {
-        out_4[i] = in_4[i];
+
+    /* Only use vectorized uint4 loads if both pointers are 16-byte aligned (C-4) */
+    if (((uintptr_t)in_data & 0xF) == 0 && ((uintptr_t)out_data & 0xF) == 0) {
+        size_t copy_len_uint4 = copy_len / 16;
+        uint4 *out_4 = (uint4 *)out_data;
+        const uint4 *in_4 = (const uint4 *)in_data;
+        for (size_t i = threadIdx.x; i < copy_len_uint4; i += blockDim.x) {
+            out_4[i] = in_4[i];
+        }
+        /* Tail bytes */
+        for (size_t i = copy_len_uint4 * 16 + threadIdx.x; i < copy_len; i += blockDim.x) {
+            out_data[i] = in_data[i];
+        }
+    } else {
+        /* Byte-level fallback for unaligned data */
+        for (size_t i = threadIdx.x; i < copy_len; i += blockDim.x) {
+            out_data[i] = in_data[i];
+        }
     }
-    
-    for (size_t i = copy_len_uint4 * 16 + threadIdx.x; i < copy_len; i += blockDim.x) {
-        out_data[i] = in_data[i];
-    }
-    
+
     __syncthreads();
     if (threadIdx.x == 0) {
         *actual_out_size = copy_len;
@@ -99,21 +108,26 @@ __device__ void device_decompress_lz4(const uint8_t *in_data, size_t in_len,
                                       uint8_t *out_data, size_t out_max,
                                       size_t *actual_out_size)
 {
-    /* Fallback stub: vectorized uint4 memory copy */
+    /* Fallback stub: memory copy (no decompression) */
     size_t copy_len = (in_len < out_max) ? in_len : out_max;
-    size_t copy_len_uint4 = copy_len / 16;
-    
-    uint4 *out_4 = (uint4 *)out_data;
-    const uint4 *in_4 = (const uint4 *)in_data;
-    
-    for (size_t i = threadIdx.x; i < copy_len_uint4; i += blockDim.x) {
-        out_4[i] = in_4[i];
+
+    /* Only use vectorized uint4 loads if both pointers are 16-byte aligned (C-4) */
+    if (((uintptr_t)in_data & 0xF) == 0 && ((uintptr_t)out_data & 0xF) == 0) {
+        size_t copy_len_uint4 = copy_len / 16;
+        uint4 *out_4 = (uint4 *)out_data;
+        const uint4 *in_4 = (const uint4 *)in_data;
+        for (size_t i = threadIdx.x; i < copy_len_uint4; i += blockDim.x) {
+            out_4[i] = in_4[i];
+        }
+        for (size_t i = copy_len_uint4 * 16 + threadIdx.x; i < copy_len; i += blockDim.x) {
+            out_data[i] = in_data[i];
+        }
+    } else {
+        for (size_t i = threadIdx.x; i < copy_len; i += blockDim.x) {
+            out_data[i] = in_data[i];
+        }
     }
-    
-    for (size_t i = copy_len_uint4 * 16 + threadIdx.x; i < copy_len; i += blockDim.x) {
-        out_data[i] = in_data[i];
-    }
-    
+
     __syncthreads();
     if (threadIdx.x == 0) {
         *actual_out_size = copy_len;

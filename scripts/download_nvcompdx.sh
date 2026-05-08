@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-DEST_DIR="/mnt/data1/persistent-gpu-server/_deps/mathdx"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEST_DIR="${SCRIPT_DIR}/../_deps/mathdx"
 
 if [ -d "$DEST_DIR" ] && [ -f "$DEST_DIR/include/nvcompdx.hpp" ]; then
     echo "nvCOMPDx (MathDx) already exists at $DEST_DIR. Skipping download."

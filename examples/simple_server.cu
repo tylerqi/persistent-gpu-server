@@ -66,10 +66,10 @@ int main(void)
         printf("[5] SHA256 done (error_code=%d)\n", result.error_code);
     }
 
-    /* 4. Shutdown */
+    /* 6. Shutdown */
     gpu_engine_fini(engine);
     cudaFree(d_data);
-    printf("[4] Engine shutdown complete. Exiting.\n");
+    printf("[6] Engine shutdown complete. Exiting.\n");
 
     return 0;
 }

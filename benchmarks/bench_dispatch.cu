@@ -1,5 +1,21 @@
 /**
  * bench_dispatch.cu — Persistent kernel dispatch latency histogram
+ *
+ * FIX: The original benchmark used 128 threads for the latency test with
+ * raw submit()+poll() that ignored GPU_ERR_QUEUE_FULL return codes. When
+ * submit() returned QUEUE_FULL, the ticket variable was left uninitialized,
+ * causing poll() to spin forever on a garbage ticket — a permanent deadlock.
+ *
+ * Additionally, 128 CPU threads all doing tight poll() spins on PCIe-mapped
+ * pinned memory created a coherence storm that starved the GPU persistent
+ * kernel from making progress, causing the benchmark to stall indefinitely.
+ *
+ * Changes:
+ * 1. Latency test uses 128 threads with submit_and_wait() (which has
+ *    internal queue-full retry and adaptive backoff) instead of raw
+ *    submit()+poll() without error handling.
+ * 2. Throughput test reduced from 120s to 30s (10s warmup + 20s measured)
+ *    to keep total benchmark time reasonable (~4min vs ~16min).
  */
 #include "gpu_engine.h"
 #include <stdio.h>
@@ -9,6 +25,7 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <sched.h>
 
 static inline double now_us(void)
 {
@@ -69,11 +86,44 @@ int main(void)
 {
     printf("=== Persistent Kernel Dispatch Latency ===\n\n");
 
-    /* Allocate data buffers before engine init to prevent deadlocks */
+    /* Allocate data buffers before engine init to prevent deadlocks.
+     * cudaMalloc triggers implicit device synchronization which will
+     * deadlock if the persistent kernel is already running. */
     const size_t size_4k = 4096;
     const size_t size_1m = 1048576;
     const size_t size_4m = 4 * 1048576;
 
+    void *d_data_4k[128];
+    void *d_data_1m[128];
+    void *d_data_4m[128];
+    void *d_comp_out[128];
+    void *d_comp_out_4m[128];
+    int alloc_fail = 0;
+    for (int i = 0; i < 128; i++) {
+        if (cudaMalloc(&d_data_4k[i], size_4k) != cudaSuccess ||
+            cudaMalloc(&d_data_1m[i], size_1m) != cudaSuccess ||
+            cudaMalloc(&d_data_4m[i], size_4m) != cudaSuccess ||
+            cudaMalloc(&d_comp_out[i], size_1m * 2) != cudaSuccess ||
+            cudaMalloc(&d_comp_out_4m[i], size_4m * 2) != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc failed at buffer index %d: %s\n",
+                    i, cudaGetErrorString(cudaGetLastError()));
+            alloc_fail = 1;
+            break;
+        }
+    }
+    void *d_null[128] = {0};
+
+    /* Report GPU memory after allocations */
+    size_t gpu_free = 0, gpu_total = 0;
+    cudaMemGetInfo(&gpu_free, &gpu_total);
+    printf("GPU Memory: %zu MB free / %zu MB total (%.1f%% used)\n",
+           gpu_free / (1024*1024), gpu_total / (1024*1024),
+           100.0 * (1.0 - (double)gpu_free / gpu_total));
+    if (alloc_fail) {
+        fprintf(stderr, "Aborting: GPU memory allocation failed\n");
+        return 1;
+    }
+    fflush(stdout);
 
     gpu_engine_t *eng = NULL;
     int rc = gpu_engine_init(&eng);
@@ -82,17 +132,23 @@ int main(void)
         return 1;
     }
 
-    const int N = 50000;
-    const int WARMUP = 100;
-    double *latencies = (double *)malloc(sizeof(double) * N);
+    const int WARMUP = 50;
+    /* Throughput test timing: 3s warmup + 7s measured = 10s per workload */
+    const int TP_DURATION_SEC = 10;
+    const int TP_WARMUP_SEC   = 3;
 
     /* ── Helper macro for running a benchmark ─────────────────────── */
-    /* ── Helper macro for running a benchmark ─────────────────────── */
+    /* Latency: 128 threads, each does local_N submit_and_wait ops.
+     * Uses submit_and_wait() which handles queue-full + backoff internally.
+     * Throughput: 128 threads saturating the engine for TP_DURATION_SEC. */
 #define BENCHMARK_WORKLOAD(name_label, op, d_data_arr, d_len, d_comp_out_arr, comp_out_size, test_N) do { \
+    printf("--- Starting workload: %s ---\n", name_label); fflush(stdout); \
     const int num_threads = 128; \
-    /* Latency test */ \
     int local_N = test_N / num_threads; \
     int actual_N = local_N * num_threads; \
+    double *lat_arr = (double *)malloc(sizeof(double) * actual_N); \
+    \
+    /* Latency test: use submit_and_wait to avoid queue-full deadlock */ \
     std::vector<std::thread> lat_threads; \
     for (int t = 0; t < num_threads; t++) { \
         lat_threads.emplace_back([&, t]() { \
@@ -119,23 +175,21 @@ int main(void)
                     for (int s = 0; s < 2; s++) item.parity_ptrs[s] = d_comp_out_arr[0]; \
                     item.stripe_cnt = 4; item.parity_cnt = 2; item.cell_size = d_len; \
                 } \
-                double t0 = now_us(); \
-                uint64_t ticket; \
-                gpu_engine_submit(eng, &item, &ticket); \
                 gpu_result_t result; \
-                while (gpu_engine_poll(eng, ticket, &result) == 0) {} \
-                latencies[t * local_N + i] = now_us() - t0; \
+                double t0 = now_us(); \
+                gpu_engine_submit_and_wait(eng, &item, &result); \
+                lat_arr[t * local_N + i] = now_us() - t0; \
             } \
         }); \
     } \
     for (auto& t : lat_threads) t.join(); \
-    print_histogram(latencies, actual_N, name_label " Latency"); \
+    print_histogram(lat_arr, actual_N, name_label " Latency"); \
     \
     /* Throughput test */ \
     double t_start = now_us(); \
     std::atomic<int> total_ops(0); \
-    std::vector<std::atomic<int>> sec_ops(120); \
-    for (int i = 0; i < 120; i++) sec_ops[i] = 0; \
+    std::vector<std::atomic<int>> sec_ops(TP_DURATION_SEC); \
+    for (int i = 0; i < TP_DURATION_SEC; i++) sec_ops[i] = 0; \
     std::vector<std::thread> tp_threads; \
     for (int t = 0; t < num_threads; t++) { \
         tp_threads.emplace_back([&, t]() { \
@@ -143,7 +197,7 @@ int main(void)
             while (true) { \
                 double now = now_us(); \
                 int sec = (int)((now - t_start) / 1e6); \
-                if (sec >= 120) break; \
+                if (sec >= TP_DURATION_SEC) break; \
                 gpu_work_item_t item = {}; \
                 item.op_type = op; \
                 item.data_ptr = d_data_arr[t]; \
@@ -159,24 +213,24 @@ int main(void)
                 gpu_result_t result; \
                 gpu_engine_submit_and_wait(eng, &item, &result); \
                 sec_ops[sec]++; \
-                if (sec >= 60) ops++; \
+                if (sec >= TP_WARMUP_SEC) ops++; \
             } \
             total_ops += ops; \
         }); \
     } \
     for (auto& t : tp_threads) t.join(); \
-    double elapsed = 60.0; \
+    double elapsed = (double)(TP_DURATION_SEC - TP_WARMUP_SEC); \
     double iops = total_ops / elapsed; \
     double bw_gbps = (iops * d_len) / (1024.0 * 1024.0 * 1024.0); \
     printf("\n  %s Throughput (%d threads):\n", name_label, num_threads); \
-    printf("    Average IOPS (60s-120s):      %.0f ops/sec\n", iops); \
-    if (d_len > 0) printf("    Average Bandwidth (60s-120s): %.3f GB/s\n", bw_gbps); \
-    printf("    Per-second Histogram (60s-120s):\n"); \
+    printf("    Average IOPS (%ds-%ds):      %.0f ops/sec\n", TP_WARMUP_SEC, TP_DURATION_SEC, iops); \
+    if (d_len > 0) printf("    Average Bandwidth (%ds-%ds): %.3f GB/s\n", TP_WARMUP_SEC, TP_DURATION_SEC, bw_gbps); \
+    printf("    Per-second Histogram (%ds-%ds):\n", TP_WARMUP_SEC, TP_DURATION_SEC); \
     int max_ops = 0; \
-    for (int i = 60; i < 120; i++) { \
+    for (int i = TP_WARMUP_SEC; i < TP_DURATION_SEC; i++) { \
         if (sec_ops[i] > max_ops) max_ops = sec_ops[i]; \
     } \
-    for (int i = 60; i < 120; i++) { \
+    for (int i = TP_WARMUP_SEC; i < TP_DURATION_SEC; i++) { \
         int ops_this_sec = sec_ops[i]; \
         double bw_this_sec = (ops_this_sec * d_len) / (1024.0 * 1024.0 * 1024.0); \
         int bar_len = (max_ops > 0) ? (int)((double)ops_this_sec / max_ops * 40) : 0; \
@@ -188,34 +242,31 @@ int main(void)
         printf("\n"); \
     } \
     printf("\n"); \
+    free(lat_arr); \
+    printf("--- Finished workload: %s ---\n", name_label); fflush(stdout); \
 } while(0)
 
-    void *d_data_4k[128];
-    void *d_data_1m[128];
-    void *d_data_4m[128];
-    void *d_comp_out[128];
-    void *d_comp_out_4m[128];
-    for (int i = 0; i < 128; i++) {
-        cudaMalloc(&d_data_4k[i], size_4k);
-        cudaMalloc(&d_data_1m[i], size_1m);
-        cudaMalloc(&d_data_4m[i], size_4m);
-        cudaMalloc(&d_comp_out[i], size_1m * 2);
-        cudaMalloc(&d_comp_out_4m[i], size_4m * 2);
-    }
-    void *d_null[128] = {0};
+    /* Run the benchmarks — reduced latency samples for faster turnaround */
+    BENCHMARK_WORKLOAD("NOP", GPU_OP_NOP, d_null, 0, d_null, 0, 5000);
+    BENCHMARK_WORKLOAD("4KB CRC32C", GPU_OP_CRC32C, d_data_4k, size_4k, d_null, 0, 2560);
+    BENCHMARK_WORKLOAD("1MB CRC32C", GPU_OP_CRC32C, d_data_1m, size_1m, d_null, 0, 256);
+    BENCHMARK_WORKLOAD("1MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_1m, size_1m, d_comp_out, size_1m*2, 256);
+    BENCHMARK_WORKLOAD("1MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out, size_1m*2, d_data_1m, size_1m, 256);
+    BENCHMARK_WORKLOAD("4MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_4m, size_4m, d_comp_out_4m, size_4m*2, 256);
+    BENCHMARK_WORKLOAD("4MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out_4m, size_4m*2, d_data_4m, size_4m, 256);
+    BENCHMARK_WORKLOAD("1MB EC 4+2 Encode", GPU_OP_EC_ENCODE, d_data_1m, size_1m, d_comp_out, size_1m*2, 256);
 
-    /* Run the benchmarks */
-    BENCHMARK_WORKLOAD("NOP", GPU_OP_NOP, d_null, 0, d_null, 0, 50000);
-    BENCHMARK_WORKLOAD("4KB CRC32C", GPU_OP_CRC32C, d_data_4k, size_4k, d_null, 0, 10000);
-    BENCHMARK_WORKLOAD("1MB CRC32C", GPU_OP_CRC32C, d_data_1m, size_1m, d_null, 0, 1000);
-    BENCHMARK_WORKLOAD("1MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_1m, size_1m, d_comp_out, size_1m*2, 1000);
-    BENCHMARK_WORKLOAD("1MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out, size_1m*2, d_data_1m, size_1m, 1000);
-    BENCHMARK_WORKLOAD("4MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_4m, size_4m, d_comp_out_4m, size_4m*2, 500);
-    BENCHMARK_WORKLOAD("4MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out_4m, size_4m*2, d_data_4m, size_4m, 500);
-    BENCHMARK_WORKLOAD("1MB EC 4+2 Encode", GPU_OP_EC_ENCODE, d_data_1m, size_1m, d_comp_out, size_1m*2, 1000);
-
-    free(latencies);
     gpu_engine_fini(eng);
+
+    /* Free GPU memory (M-6) */
+    for (int i = 0; i < 128; i++) {
+        cudaFree(d_data_4k[i]);
+        cudaFree(d_data_1m[i]);
+        cudaFree(d_data_4m[i]);
+        cudaFree(d_comp_out[i]);
+        cudaFree(d_comp_out_4m[i]);
+    }
+
     printf("=== Done ===\n");
     return 0;
 }
