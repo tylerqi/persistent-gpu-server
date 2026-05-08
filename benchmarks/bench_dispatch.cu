@@ -84,7 +84,17 @@ static void print_histogram(double *latencies, int n, const char *label)
 
 int main(void)
 {
-    printf("=== Persistent Kernel Dispatch Latency ===\n\n");
+    printf("=== Persistent Kernel Dispatch Benchmark ===\n\n");
+
+    /* NOTE: All data buffers are pre-allocated on the GPU. Bandwidth numbers
+     * represent GPU-internal processing rate (VRAM-to-VRAM), NOT PCIe transfer
+     * bandwidth. PCIe 3.0 x16 is ~15.75 GB/s; numbers above that indicate
+     * the operation is GPU-bound, not transfer-bound. */
+#ifndef USE_NVCOMPDX
+    printf("WARNING: nvCOMPDx not installed. LZ4 compress/decompress use\n"
+           "         memcpy stubs (no actual compression). Bandwidth numbers\n"
+           "         reflect GPU VRAM memcpy speed, not real compression.\n\n");
+#endif
 
     /* Allocate data buffers before engine init to prevent deadlocks.
      * cudaMalloc triggers implicit device synchronization which will
@@ -224,7 +234,7 @@ int main(void)
     double bw_gbps = (iops * d_len) / (1024.0 * 1024.0 * 1024.0); \
     printf("\n  %s Throughput (%d threads):\n", name_label, num_threads); \
     printf("    Average IOPS (%ds-%ds):      %.0f ops/sec\n", TP_WARMUP_SEC, TP_DURATION_SEC, iops); \
-    if (d_len > 0) printf("    Average Bandwidth (%ds-%ds): %.3f GB/s\n", TP_WARMUP_SEC, TP_DURATION_SEC, bw_gbps); \
+    if (d_len > 0) printf("    GPU Data Rate (%ds-%ds):     %.3f GB/s (VRAM, not PCIe)\n", TP_WARMUP_SEC, TP_DURATION_SEC, bw_gbps); \
     printf("    Per-second Histogram (%ds-%ds):\n", TP_WARMUP_SEC, TP_DURATION_SEC); \
     int max_ops = 0; \
     for (int i = TP_WARMUP_SEC; i < TP_DURATION_SEC; i++) { \
@@ -235,7 +245,7 @@ int main(void)
         double bw_this_sec = (ops_this_sec * d_len) / (1024.0 * 1024.0 * 1024.0); \
         int bar_len = (max_ops > 0) ? (int)((double)ops_this_sec / max_ops * 40) : 0; \
         printf("      [%3ds]: %7d IOPS ", i+1, ops_this_sec); \
-        if (d_len > 0) printf("(%5.3f GB/s) ", bw_this_sec); \
+        if (d_len > 0) printf("(%6.3f GB/s VRAM) ", bw_this_sec); \
         else printf("              "); \
         printf("|"); \
         for (int b = 0; b < bar_len; b++) printf("="); \

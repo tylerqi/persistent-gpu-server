@@ -267,10 +267,18 @@ Measured on NVIDIA RTX 2060 SUPER (8 GB, 34 SMs, sm_75):
 |--------|-------|
 | NOP dispatch (p50) | ~714 µs |
 | NOP throughput (128 threads) | 176K IOPS |
-| 4KB CRC32C throughput | 172K IOPS (0.66 GB/s) |
-| 1MB LZ4 compress throughput | 110K IOPS (107 GB/s) |
-| 1MB LZ4 decompress throughput | 109K IOPS (213 GB/s) |
-| 4MB LZ4 decompress throughput | 35K IOPS (272 GB/s) |
-| 1MB EC 4+2 encode throughput | 52K IOPS (51 GB/s) |
+| 4KB CRC32C throughput | 172K IOPS |
+| 1MB LZ4 compress throughput* | 110K IOPS |
+| 1MB LZ4 decompress throughput* | 109K IOPS |
+| 4MB LZ4 decompress throughput* | 35K IOPS |
+| 1MB EC 4+2 encode throughput | 52K IOPS |
 | Queue depth | 4096 |
 | GPU memory overhead | ~1.4 MB (queue + results) |
+
+> **Note**: GPU Data Rate numbers (e.g., 107 GB/s for LZ4 compress) represent
+> GPU-internal VRAM-to-VRAM processing speed, **not** PCIe transfer bandwidth.
+> All data is pre-resident on the GPU. PCIe 3.0 x16 is ~15.75 GB/s; end-to-end
+> throughput including host↔device transfer will be PCIe-limited.
+>
+> **\*** LZ4 compress/decompress running in memcpy stub mode (nvCOMPDx not installed).
+> IOPS numbers reflect dispatch throughput only.

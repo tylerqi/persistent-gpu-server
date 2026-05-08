@@ -256,6 +256,8 @@ Two code paths controlled by `USE_NVCOMPDX`:
 
 The stub path enables full system testing without the nvCOMPDx dependency. Both paths participate in the block-cooperative execution model (all 128 threads active).
 
+> **⚠ Bandwidth caveat**: In stub mode, LZ4 "compression" is a GPU VRAM-to-VRAM memcpy (~448 GB/s peak on RTX 2060 SUPER). Benchmark bandwidth numbers like "107 GB/s" or "272 GB/s" reflect this VRAM copy speed and **do not represent actual compression throughput or PCIe transfer bandwidth** (PCIe 3.0 x16 ≈ 15.75 GB/s). Only IOPS numbers are meaningful as a measure of dispatch overhead.
+
 ## 6. Memory Pool Design
 
 ### 6.1 Problem

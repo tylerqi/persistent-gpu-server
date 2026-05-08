@@ -87,16 +87,20 @@ cudaFree(d_data);  // Safe to free AFTER engine shutdown
 
 Measured on NVIDIA RTX 2060 SUPER (8 GB, 34 SMs, sm_75) with 128 concurrent threads:
 
-| Operation | IOPS | Bandwidth | Latency (p50) |
-|-----------|------|-----------|---------------|
+| Operation | IOPS | GPU Data Rate† | Latency (p50) |
+|-----------|------|----------------|---------------|
 | NOP dispatch | 175,819 | — | 714 µs |
 | 4KB CRC32C | 171,676 | 0.66 GB/s | 738 µs |
 | 1MB CRC32C | 985 | 0.96 GB/s | 102 ms |
-| 1MB LZ4 Compress | 109,725 | 107 GB/s | 238 µs |
-| 1MB LZ4 Decompress | 109,211 | 213 GB/s | 188 µs |
-| 4MB LZ4 Compress | 34,826 | 136 GB/s | 196 µs |
-| 4MB LZ4 Decompress | 34,780 | 272 GB/s | 185 µs |
+| 1MB LZ4 Compress* | 109,725 | 107 GB/s | 238 µs |
+| 1MB LZ4 Decompress* | 109,211 | 213 GB/s | 188 µs |
+| 4MB LZ4 Compress* | 34,826 | 136 GB/s | 196 µs |
+| 4MB LZ4 Decompress* | 34,780 | 272 GB/s | 185 µs |
 | 1MB EC 4+2 Encode | 51,962 | 51 GB/s | 761 µs |
+
+> **†** GPU Data Rate = `IOPS × data_size`. Measures GPU-internal (VRAM-to-VRAM) processing throughput, **not** PCIe transfer bandwidth. PCIe 3.0 x16 is ~15.75 GB/s; these numbers are higher because data is pre-resident on the GPU.
+>
+> **\*** LZ4 running in **memcpy stub mode** (nvCOMPDx not installed). Numbers reflect GPU VRAM copy speed with zero actual compression. With nvCOMPDx, expect real LZ4 ratios but lower throughput due to compute overhead.
 
 ## Project Structure
 
