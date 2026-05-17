@@ -171,6 +171,40 @@ static int test_sha256_single_byte(void)
     return 0;
 }
 
+/* Test SHA256: CPU vs GPU cross-check on 64KB arbitrary data */
+static int test_sha256_cpu_crosscheck(void)
+{
+    const size_t len = 64 * 1024;
+    uint8_t *h_data = (uint8_t *)malloc(len);
+    for (size_t i = 0; i < len; i++)
+        h_data[i] = (uint8_t)((i * 37 + 13) & 0xFF);
+
+    /* GPU SHA256 */
+    void *d_data;
+    cudaMalloc(&d_data, len);
+    cudaMemcpy(d_data, h_data, len, cudaMemcpyHostToDevice);
+    uint8_t gpu_result[32];
+    gpu_sha256(d_data, len, gpu_result);
+    cudaFree(d_data);
+
+    /* CPU SHA256 */
+    uint8_t cpu_result[32];
+    cpu_sha256(h_data, len, cpu_result);
+    free(h_data);
+
+    if (memcmp(gpu_result, cpu_result, 32) != 0) {
+        printf("  GPU: ");
+        for (int i = 0; i < 32; i++) printf("%02x", gpu_result[i]);
+        printf("\n  CPU: ");
+        for (int i = 0; i < 32; i++) printf("%02x", cpu_result[i]);
+        printf("\n");
+        TEST_FAIL("sha256_cpu_crosscheck", "GPU vs CPU mismatch on 64KB data");
+    }
+
+    TEST_PASS("sha256_cpu_crosscheck");
+    return 0;
+}
+
 int main(void)
 {
     printf("=== test_csum ===\n");
@@ -180,6 +214,7 @@ int main(void)
     failures += test_crc32c_zeros();
     failures += test_sha256_known();
     failures += test_sha256_single_byte();
+    failures += test_sha256_cpu_crosscheck();
     printf("=== %s (%d failures) ===\n", failures ? "FAILED" : "PASSED", failures);
     return failures;
 }

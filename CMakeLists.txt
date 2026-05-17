@@ -19,12 +19,7 @@ find_package(CUDAToolkit REQUIRED)
 # ── CUDA flags ───────────────────────────────────────────────────────────
 # --allow-unsupported-compiler: needed for GCC 15+ with nvcc 12.9
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -allow-unsupported-compiler")
-# Use LTO code generation for nvCOMPDx compatibility:
-# code=lto_<arch> generates NVVM/LTO-IR instead of SASS, which is required
-# to link against nvCOMPDx's LTO-IR .a library. nvlink performs final
-# optimization across all LTO-IR objects.
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_${CUDA_ARCH},code=lto_${CUDA_ARCH}")
-# Also generate native SASS for direct execution (needed for non-LTO paths)
+# Generate native SASS for direct execution
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH}")
 # Disable CMake's auto-gencode since we handle it manually
 set(CMAKE_CUDA_ARCHITECTURES OFF)
@@ -33,20 +28,30 @@ set(CMAKE_CUDA_ARCHITECTURES OFF)
 # Search for MathDx (nvCOMPDx) for device-side compression
 # Try multiple candidate paths for MathDx installation
 set(MATHDX_CANDIDATES
+    "${CMAKE_CURRENT_SOURCE_DIR}/_deps/nvidia-mathdx-26.03/nvidia/mathdx/26.03"
     "${CMAKE_CURRENT_SOURCE_DIR}/_deps/mathdx"
     "${CMAKE_CURRENT_SOURCE_DIR}/_deps/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06"
     "${CMAKE_CURRENT_SOURCE_DIR}/_deps/nvidia-mathdx-25.06.0/nvidia/mathdx/25.06"
     "${CMAKE_CURRENT_SOURCE_DIR}/_deps/nvidia-mathdx-25.12.1-cuda12/nvidia/mathdx/25.12"
 )
 set(MATHDX_DIR "" CACHE PATH "Path to NVIDIA MathDx (auto-detected if empty)")
+option(BUILD_WITH_NVCOMPDX "Enable nvCOMPDx LZ4 compression (requires compatible MathDx + CUDA version)" ON)
 set(MATHDX_FOUND FALSE)
-foreach(CANDIDATE ${MATHDX_CANDIDATES})
-    if(EXISTS "${CANDIDATE}/include/nvcompdx.hpp")
-        set(MATHDX_DIR "${CANDIDATE}")
+if(BUILD_WITH_NVCOMPDX)
+    # Respect user-provided MATHDX_DIR first
+    if(MATHDX_DIR AND EXISTS "${MATHDX_DIR}/include/nvcompdx.hpp")
         set(MATHDX_FOUND TRUE)
-        break()
+    else()
+        # Auto-detect from candidate paths
+        foreach(CANDIDATE ${MATHDX_CANDIDATES})
+            if(EXISTS "${CANDIDATE}/include/nvcompdx.hpp")
+                set(MATHDX_DIR "${CANDIDATE}")
+                set(MATHDX_FOUND TRUE)
+                break()
+            endif()
+        endforeach()
     endif()
-endforeach()
+endif()
 if(MATHDX_FOUND)
     message(STATUS "Found MathDx (nvCOMPDx) at ${MATHDX_DIR}")
     add_compile_definitions(USE_NVCOMPDX)
@@ -56,18 +61,33 @@ if(MATHDX_FOUND)
     if(EXISTS "${MATHDX_DIR}/external/cutlass/include")
         include_directories(${MATHDX_DIR}/external/cutlass/include)
     endif()
-    # nvCOMPDx is distributed as LTO-IR (.a / .fatbin); prefer .fatbin for cross-version compat
+    # nvCOMPDx may be distributed as LTO-IR (.a / .fatbin); prefer .fatbin for cross-version compat.
+    # Newer versions (pip: nvidia-mathdx >= 25.6.0) are header-only and need no library linkage.
+    # NOTE: The fatbin/lib is passed to the device linker via DEVICE_LINK target_link_options
+    # below (not via EXTRA_LIBS), because the host linker cannot handle .fatbin format.
     set(NVCOMPDX_FATBIN "${MATHDX_DIR}/lib/libnvcompdx.fatbin")
     find_library(NVCOMPDX_LIB NAMES nvcompdx PATHS "${MATHDX_DIR}/lib" "${MATHDX_DIR}/lib64")
+    set(NVCOMPDX_NEEDS_LTO FALSE)
     if(EXISTS "${NVCOMPDX_FATBIN}")
-        list(APPEND EXTRA_LIBS ${NVCOMPDX_FATBIN})
+        set(NVCOMPDX_NEEDS_LTO TRUE)
         message(STATUS "  libnvcompdx.fatbin: ${NVCOMPDX_FATBIN}")
     elseif(NVCOMPDX_LIB)
-        list(APPEND EXTRA_LIBS ${NVCOMPDX_LIB})
+        set(NVCOMPDX_NEEDS_LTO TRUE)
         message(STATUS "  libnvcompdx: ${NVCOMPDX_LIB}")
+    else()
+        message(STATUS "  nvCOMPDx header-only mode (no fatbin/lib found)")
     endif()
+    # LTO code generation is required ONLY for linking against nvCOMPDx's LTO-IR library.
+    # code=lto_<arch> generates NVVM/LTO-IR instead of SASS. nvlink performs final
+    # optimization across all LTO-IR objects.
+    # NOTE: The LTO gencode is applied per-target (daos_gpu_engine only) below,
+    # not globally, because non-RDC targets (tests, benchmarks) cannot use lto_<arch>.
 else()
-    message(WARNING "MathDx (nvCOMPDx) not found. Falling back to uncompressed stubs. Run scripts/download_nvcompdx.sh or set MATHDX_DIR.")
+    if(BUILD_WITH_NVCOMPDX)
+        message(WARNING "MathDx (nvCOMPDx) not found. Falling back to uncompressed stubs. Run scripts/download_nvcompdx.sh or set MATHDX_DIR.")
+    else()
+        message(STATUS "nvCOMPDx disabled by BUILD_WITH_NVCOMPDX=OFF. Using memcpy stubs.")
+    endif()
 endif()
 
 # ── Library: libdaos_gpu_engine ──────────────────────────────────────────
@@ -92,8 +112,19 @@ set_target_properties(daos_gpu_engine PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
-# Device link must use -dlto to resolve LTO-IR objects from nvCOMPDx
-target_link_options(daos_gpu_engine PRIVATE $<DEVICE_LINK:-dlto>)
+# Device link must use -dlto to resolve LTO-IR objects from nvCOMPDx.
+# The fatbin/lib must be explicitly passed to the device linker since CMake's
+# target_link_libraries does not forward .fatbin files to the nvlink phase.
+if(NVCOMPDX_NEEDS_LTO)
+    # Add LTO gencode only to this target (requires CUDA_SEPARABLE_COMPILATION / -rdc=true)
+    target_compile_options(daos_gpu_engine PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode;arch=compute_${CUDA_ARCH},code=lto_${CUDA_ARCH}>)
+    if(EXISTS "${NVCOMPDX_FATBIN}")
+        target_link_options(daos_gpu_engine PRIVATE $<DEVICE_LINK:-dlto;${NVCOMPDX_FATBIN}>)
+    elseif(NVCOMPDX_LIB)
+        target_link_options(daos_gpu_engine PRIVATE $<DEVICE_LINK:-dlto;${NVCOMPDX_LIB}>)
+    endif()
+endif()
 
 # ── Tests ────────────────────────────────────────────────────────────────
 enable_testing()
@@ -119,6 +150,8 @@ set_tests_properties(test_latency PROPERTIES TIMEOUT 180)
 add_gpu_test(test_compress  tests/test_compress.cu)
 add_gpu_test(test_verify_all tests/test_verify_all.cu)
 add_gpu_test(test_mempool    tests/test_mempool.cu)
+add_gpu_test(test_ec_decode  tests/test_ec_decode.cu)
+add_gpu_test(test_metrics    tests/test_metrics.cu)
 
 # ── Benchmarks ───────────────────────────────────────────────────────────
 add_executable(bench_csum     benchmarks/bench_csum.cu)
@@ -128,6 +161,18 @@ target_include_directories(bench_csum PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 add_executable(bench_dispatch benchmarks/bench_dispatch.cu)
 target_link_libraries(bench_dispatch PRIVATE daos_gpu_engine CUDA::cudart)
 target_include_directories(bench_dispatch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(bench_compress benchmarks/bench_compress.cu)
+target_link_libraries(bench_compress PRIVATE daos_gpu_engine CUDA::cudart)
+target_include_directories(bench_compress PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(bench_ec benchmarks/bench_ec.cu)
+target_link_libraries(bench_ec PRIVATE daos_gpu_engine CUDA::cudart)
+target_include_directories(bench_ec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(bench_e2e benchmarks/bench_e2e.cu)
+target_link_libraries(bench_e2e PRIVATE daos_gpu_engine CUDA::cudart)
+target_include_directories(bench_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ── Example ──────────────────────────────────────────────────────────────
 add_executable(simple_server  examples/simple_server.cu)

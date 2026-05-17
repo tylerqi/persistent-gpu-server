@@ -49,7 +49,7 @@ make -j$(nproc)
 
 ```bash
 cd build
-ctest --output-on-failure     # Run all 8 unit tests
+ctest --output-on-failure     # Run all 10 unit tests
 ./bench_csum                  # CRC32C benchmark
 ./bench_dispatch              # Full dispatch benchmark (128 threads, ~90s)
 ```
@@ -100,7 +100,7 @@ Measured on NVIDIA RTX 2060 SUPER (8 GB, 34 SMs, sm_75) with 128 concurrent thre
 
 > **†** GPU Data Rate = `IOPS × data_size`. Measures GPU-internal (VRAM-to-VRAM) processing throughput, **not** PCIe transfer bandwidth. PCIe 3.0 x16 is ~15.75 GB/s; these numbers are higher because data is pre-resident on the GPU.
 >
-> **\*** LZ4 running in **memcpy stub mode** (nvCOMPDx not installed). Numbers reflect GPU VRAM copy speed with zero actual compression. With nvCOMPDx, expect real LZ4 ratios but lower throughput due to compute overhead.
+> **\*** LZ4 running in **memcpy stub mode**. The nvCOMPDx LZ4 device-side API is defined in MathDx headers, but the pre-compiled `libnvcompdx.fatbin` only ships ANS algorithm implementations. Numbers reflect GPU VRAM copy speed with zero actual compression.
 
 ## Project Structure
 
@@ -120,7 +120,7 @@ persistent-gpu-server/
 │   ├── gpu_comp.cu       # LZ4 compress/decompress
 │   ├── gpu_mem.cu        # Memory utilities
 │   └── gpu_mempool.cu    # Lock-free Treiber stack allocator
-├── tests/                # 8 unit tests (31 sub-tests)
+├── tests/                # 10 unit tests (36 sub-tests)
 ├── benchmarks/           # Throughput + latency benchmarks
 ├── examples/             # simple_server.cu
 ├── docs/                 # Architecture & design documents
@@ -155,6 +155,7 @@ persistent-gpu-server/
 | `GPU_OP_CRC32C` | CRC32C checksum |
 | `GPU_OP_SHA256` | SHA256 hash |
 | `GPU_OP_EC_ENCODE` | EC parity generation (P + Q) |
+| `GPU_OP_EC_DECODE` | EC data reconstruction (1 or 2 failures) |
 | `GPU_OP_COMPRESS_LZ4` | LZ4 compression |
 | `GPU_OP_DECOMPRESS_LZ4` | LZ4 decompression |
 

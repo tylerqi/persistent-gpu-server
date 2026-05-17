@@ -27,6 +27,11 @@ __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
                                  uint32_t stripe_cnt, uint32_t parity_cnt,
                                  size_t cell_size);
 
+__device__ void device_ec_decode(void *const *ec_ptrs, void *const *parity_ptrs,
+                                 uint32_t stripe_cnt, uint32_t parity_cnt,
+                                 size_t cell_size,
+                                 const uint32_t *failed_idx, uint32_t failed_cnt);
+
 #ifdef __cplusplus
 }
 #endif

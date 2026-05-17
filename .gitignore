@@ -8,3 +8,5 @@ _deps/
 *.patch
 .vscode/
 .cache/
+benchmark_report_*.md
+benchmark_raw_*/

@@ -50,7 +50,7 @@ struct gpu_buffers {
     /* CRC test */
     void *crc_data;     /* 1MB */
     /* SHA test */
-    void *sha_data;     /* 3 bytes */
+    void *sha_data;     /* 64 bytes */
     /* Compress test */
     void *comp_data;    /* 4KB */
     void *comp_out;     /* 8KB */
@@ -58,6 +58,8 @@ struct gpu_buffers {
     /* EC test (4 data + 2 parity) */
     void *ec_data[4];   /* 1MB each */
     void *ec_parity[2]; /* 1MB each */
+    /* EC decode needs separate output buffer for reconstructed data */
+    void *ec_decode_out[2]; /* 1MB each (max 2 failures) */
 };
 
 /* ── Verification Tests ─────────────────────────────────────────────────── */
@@ -222,6 +224,117 @@ static int verify_ec_encode(gpu_engine_t *eng, struct gpu_buffers *buf) {
     return 0;
 }
 
+/* ── EC Decode Verification ──────────────────────────────────────────── */
+
+static int verify_ec_decode(gpu_engine_t *eng, struct gpu_buffers *buf) {
+    const uint32_t k = 4;
+    const uint32_t p = 2;
+    const size_t len = 64 * 1024; /* Use 64KB cells for speed */
+
+    /* Save original data for verification */
+    uint8_t *h_orig[4];
+    for (int i = 0; i < (int)k; i++) {
+        h_orig[i] = alloc_host_buffer(len, i * 11 + 3);
+        cudaMemcpy(buf->ec_data[i], h_orig[i], len, cudaMemcpyHostToDevice);
+    }
+
+    /* Step 1: Encode P+Q parity via persistent kernel */
+    gpu_work_item_t enc = {};
+    enc.op_type = GPU_OP_EC_ENCODE;
+    for (int i = 0; i < (int)k; i++) enc.ec_ptrs[i] = buf->ec_data[i];
+    for (int i = 0; i < (int)p; i++) enc.parity_ptrs[i] = buf->ec_parity[i];
+    enc.stripe_cnt = k;
+    enc.parity_cnt = p;
+    enc.cell_size = len;
+
+    gpu_result_t res;
+    int rc = gpu_engine_submit_and_wait(eng, &enc, &res);
+    if (rc != 0 || res.error_code != 0) {
+        for (int i = 0; i < (int)k; i++) free(h_orig[i]);
+        TEST_FAIL("verify_ec_decode", "encode failed");
+    }
+
+    /* ── Sub-test A: Single failure (D2) ─────────────────────────────── */
+    int fail_single = 2;
+    cudaMemset(buf->ec_data[fail_single], 0, len);
+
+    gpu_work_item_t dec = {};
+    dec.op_type = GPU_OP_EC_DECODE;
+    for (int i = 0; i < (int)k; i++) dec.ec_ptrs[i] = buf->ec_data[i];
+    for (int i = 0; i < (int)p; i++) dec.parity_ptrs[i] = buf->ec_parity[i];
+    dec.stripe_cnt = k;
+    dec.parity_cnt = p;
+    dec.cell_size = len;
+    dec.failed_idx[0] = fail_single;
+    dec.failed_cnt = 1;
+
+    rc = gpu_engine_submit_and_wait(eng, &dec, &res);
+    if (rc != 0 || res.error_code != 0) {
+        for (int i = 0; i < (int)k; i++) free(h_orig[i]);
+        TEST_FAIL("verify_ec_decode", "single-failure decode failed");
+    }
+
+    uint8_t *h_recon = (uint8_t *)malloc(len);
+    cudaMemcpy(h_recon, buf->ec_data[fail_single], len, cudaMemcpyDeviceToHost);
+    if (memcmp(h_recon, h_orig[fail_single], len) != 0) {
+        free(h_recon);
+        for (int i = 0; i < (int)k; i++) free(h_orig[i]);
+        TEST_FAIL("verify_ec_decode", "single-failure reconstruction mismatch");
+    }
+    free(h_recon);
+
+    /* ── Sub-test B: Double failure (D0 + D3) ────────────────────────── */
+    /* Re-upload original data (D2 was just reconstructed, should be fine;
+     * re-encode to get fresh parity) */
+    for (int i = 0; i < (int)k; i++)
+        cudaMemcpy(buf->ec_data[i], h_orig[i], len, cudaMemcpyHostToDevice);
+    rc = gpu_engine_submit_and_wait(eng, &enc, &res);
+    if (rc != 0) {
+        for (int i = 0; i < (int)k; i++) free(h_orig[i]);
+        TEST_FAIL("verify_ec_decode", "re-encode for double failure failed");
+    }
+
+    int fail_a = 0, fail_b = 3;
+    cudaMemset(buf->ec_data[fail_a], 0, len);
+    cudaMemset(buf->ec_data[fail_b], 0, len);
+
+    memset(&dec, 0, sizeof(dec));
+    dec.op_type = GPU_OP_EC_DECODE;
+    for (int i = 0; i < (int)k; i++) dec.ec_ptrs[i] = buf->ec_data[i];
+    for (int i = 0; i < (int)p; i++) dec.parity_ptrs[i] = buf->ec_parity[i];
+    dec.stripe_cnt = k;
+    dec.parity_cnt = p;
+    dec.cell_size = len;
+    dec.failed_idx[0] = fail_a;
+    dec.failed_idx[1] = fail_b;
+    dec.failed_cnt = 2;
+
+    rc = gpu_engine_submit_and_wait(eng, &dec, &res);
+    if (rc != 0 || res.error_code != 0) {
+        for (int i = 0; i < (int)k; i++) free(h_orig[i]);
+        TEST_FAIL("verify_ec_decode", "double-failure decode failed");
+    }
+
+    /* Verify both reconstructed stripes */
+    for (int fi = 0; fi < 2; fi++) {
+        int fidx = (fi == 0) ? fail_a : fail_b;
+        h_recon = (uint8_t *)malloc(len);
+        cudaMemcpy(h_recon, buf->ec_data[fidx], len, cudaMemcpyDeviceToHost);
+        if (memcmp(h_recon, h_orig[fidx], len) != 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "double-failure D%d reconstruction mismatch", fidx);
+            free(h_recon);
+            for (int i = 0; i < (int)k; i++) free(h_orig[i]);
+            TEST_FAIL("verify_ec_decode", msg);
+        }
+        free(h_recon);
+    }
+
+    for (int i = 0; i < (int)k; i++) free(h_orig[i]);
+    TEST_PASS("verify_ec_decode (single + double failure)");
+    return 0;
+}
+
 int main(void) {
     printf("=== Comprehensive Data Verification ===\n");
 
@@ -236,6 +349,7 @@ int main(void) {
     cudaMalloc(&buf.decomp_out, 4096);
     for (int i = 0; i < 4; i++) cudaMalloc(&buf.ec_data[i], 1024 * 1024);
     for (int i = 0; i < 2; i++) cudaMalloc(&buf.ec_parity[i], 1024 * 1024);
+    for (int i = 0; i < 2; i++) cudaMalloc(&buf.ec_decode_out[i], 1024 * 1024);
 
     /* Now init engine (launches persistent kernel) */
     gpu_engine_t *eng = NULL;
@@ -249,6 +363,7 @@ int main(void) {
     failures += verify_crc32c(eng, &buf);
     failures += verify_sha256(eng, &buf);
     failures += verify_ec_encode(eng, &buf);
+    failures += verify_ec_decode(eng, &buf);
 
     /* Shut down engine BEFORE freeing GPU memory */
     gpu_engine_fini(eng);
@@ -261,6 +376,7 @@ int main(void) {
     cudaFree(buf.decomp_out);
     for (int i = 0; i < 4; i++) cudaFree(buf.ec_data[i]);
     for (int i = 0; i < 2; i++) cudaFree(buf.ec_parity[i]);
+    for (int i = 0; i < 2; i++) cudaFree(buf.ec_decode_out[i]);
 
     printf("\n=== Verification %s (%d failures) ===\n", failures ? "FAILED" : "PASSED", failures);
     return failures;

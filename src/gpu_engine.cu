@@ -6,8 +6,9 @@
  */
 #include "gpu_engine.h"
 #include "gpu_error.h"
-#include "gpu_comp.h"
+#include "gpu_comp_internal.h"
 #include "gpu_csum.h"
+#include "gpu_ec.h"
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,8 @@
 
 /* ── Forward declarations of device-side compute functions ─────────────── */
 __device__ uint32_t device_crc32c(const uint8_t *data, size_t len);
+__device__ uint32_t device_crc32c_parallel(const uint8_t *data, size_t len,
+                                           uint8_t *shmem_tile, size_t tile_size);
 __device__ void     device_sha256(const uint8_t *data, size_t len, uint8_t *out);
 
 /* ── Internal engine structure ─────────────────────────────────────────── */
@@ -43,6 +46,10 @@ struct gpu_engine {
 };
 
 /* ── Persistent kernel ─────────────────────────────────────────────────── */
+
+/* Dynamic shared memory tile size for CRC cooperative loading (32 KB). */
+#define CRC_TILE_SIZE (32u * 1024u)
+
 __global__ void persistent_kernel(
     gpu_work_item_t    *queue,
     gpu_result_t       *results,
@@ -50,13 +57,20 @@ __global__ void persistent_kernel(
     volatile uint64_t  *tail,
     volatile int       *shutdown)
 {
-    /* Each block cooperatively processes work items.
-     * Only thread 0 of each block polls for work; all threads in the
-     * block participate in the compute via shared memory coordination.
-     * For simplicity in v1: only thread 0 in each block does work. */
     const int tid = threadIdx.x;
 
+    /* Dynamic shared memory — used for CRC tiling and LZ4 scratch.
+     * The kernel is launched with max(32KB, 48KB) of dynamic shmem. */
+    extern __shared__ uint8_t dyn_shmem[];
+
     __shared__ uint64_t shared_tail;
+    __shared__ gpu_work_item_t s_item;
+
+    /* Exponential backoff state — reduces PCIe polling storm.
+     * 34 blocks × 2 reads/poll × 1M polls/sec = 68M PCIe reads/sec at 1µs.
+     * With backoff: idle blocks sleep up to 100µs, cutting bus traffic ~100×. */
+    unsigned int backoff_ns = 1000; /* Start at 1µs */
+    const unsigned int BACKOFF_MAX = 100000; /* Cap at 100µs */
 
     while (!(*shutdown)) {
         /* ── Leader thread: try to claim a work item ──────────────── */
@@ -67,8 +81,8 @@ __global__ void persistent_kernel(
             if (my_tail >= cur_head) {
                 shared_tail = (uint64_t)-1;
             } else {
-                unsigned long long old_tail = atomicCAS((unsigned long long *)tail, 
-                                                        (unsigned long long)my_tail, 
+                unsigned long long old_tail = atomicCAS((unsigned long long *)tail,
+                                                        (unsigned long long)my_tail,
                                                         (unsigned long long)(my_tail + 1));
                 if (old_tail != my_tail) {
                     shared_tail = (uint64_t)-1;
@@ -81,15 +95,21 @@ __global__ void persistent_kernel(
 
         uint64_t my_tail = shared_tail;
         if (my_tail == (uint64_t)-1) {
-            /* No work available or failed claim — progressive backoff sleep */
+            /* No work — exponential backoff to reduce PCIe coherence storm */
             if (tid == 0) {
 #if __CUDA_ARCH__ >= 700
-                __nanosleep(1000); /* 1µs — reduces PCIe coherence storm */
+                __nanosleep(backoff_ns);
 #endif
+                /* Double backoff, capped at BACKOFF_MAX */
+                if (backoff_ns < BACKOFF_MAX)
+                    backoff_ns = backoff_ns * 2 < BACKOFF_MAX ? backoff_ns * 2 : BACKOFF_MAX;
             }
             __syncthreads();
             continue;
         }
+
+        /* Work found — reset backoff for fast re-polling */
+        backoff_ns = 1000;
 
         /* ── Got a work item ──────────────────────────────────────── */
         uint32_t slot = (uint32_t)(my_tail & GPU_QUEUE_MASK);
@@ -101,7 +121,6 @@ __global__ void persistent_kernel(
             int wait_spins = 0;
             while (item->op_type == GPU_OP_INVALID && !(*shutdown)) {
 #if __CUDA_ARCH__ >= 700
-                /* Progressive backoff: 100ns → 1µs as item takes longer to arrive */
                 __nanosleep(wait_spins < 100 ? 100 : 1000);
 #endif
                 wait_spins++;
@@ -111,13 +130,12 @@ __global__ void persistent_kernel(
         if (*shutdown) break;
 
         /* Thread 0 copies the item into shared memory for block-wide consistency */
-        __shared__ gpu_work_item_t s_item;
         if (tid == 0) {
-            /* Copy the struct */
             s_item = *(gpu_work_item_t*)item;
             result->error_code = GPU_SUCCESS;
         }
         __syncthreads();
+        __threadfence_system();
 
         /* ── Dispatch ─────────────────────────────────────────────── */
         switch (s_item.op_type) {
@@ -126,11 +144,19 @@ __global__ void persistent_kernel(
             break;
 
         case GPU_OP_CRC32C:
-            if (tid == 0) {
-                if (s_item.data_ptr == NULL || s_item.data_len == 0) {
-                    result->error_code = GPU_ERR_INVAL;
-                } else {
-                    /* Write CRC result to result slot (unified API) */
+            if (s_item.data_ptr == NULL || s_item.data_len == 0) {
+                if (tid == 0) result->error_code = GPU_ERR_INVAL;
+            } else if (s_item.data_len >= 65536) {
+                /* Large data: block-cooperative CRC with tiled loads.
+                 * All threads load tiles from global→shared mem,
+                 * thread 0 processes CRC from fast shared memory. */
+                uint32_t crc = device_crc32c_parallel(
+                    (const uint8_t *)s_item.data_ptr, s_item.data_len,
+                    dyn_shmem, CRC_TILE_SIZE);
+                if (tid == 0) result->crc32c_result = crc;
+            } else {
+                /* Small data: single-thread CRC avoids sync overhead */
+                if (tid == 0) {
                     result->crc32c_result = device_crc32c(
                         (const uint8_t *)s_item.data_ptr, s_item.data_len);
                 }
@@ -142,7 +168,6 @@ __global__ void persistent_kernel(
                 if (s_item.data_ptr == NULL || s_item.data_len == 0) {
                     result->error_code = GPU_ERR_INVAL;
                 } else {
-                    /* Write SHA256 result via temp buffer to avoid stripping volatile (H-5) */
                     uint8_t sha_tmp[32];
                     device_sha256((const uint8_t *)s_item.data_ptr,
                                   s_item.data_len, sha_tmp);
@@ -165,8 +190,26 @@ __global__ void persistent_kernel(
             break;
 
         case GPU_OP_EC_DECODE:
-            /* EC decode (data reconstruction) is not yet implemented (C-2) */
-            if (tid == 0) result->error_code = GPU_ERR_NOSYS;
+            if (s_item.failed_cnt == 0 || s_item.failed_cnt > 2 ||
+                s_item.stripe_cnt == 0 || s_item.cell_size == 0 ||
+                s_item.stripe_cnt > 16 || s_item.parity_cnt < s_item.failed_cnt) {
+                if (tid == 0) result->error_code = GPU_ERR_INVAL;
+            } else {
+                int valid = 1;
+                for (uint32_t fi = 0; fi < s_item.failed_cnt; fi++) {
+                    if (s_item.failed_idx[fi] >= s_item.stripe_cnt) valid = 0;
+                }
+                if (!valid) {
+                    if (tid == 0) result->error_code = GPU_ERR_INVAL;
+                } else {
+                    __syncthreads();
+                    device_ec_decode((void *const *)s_item.ec_ptrs,
+                                     (void *const *)s_item.parity_ptrs,
+                                     s_item.stripe_cnt, s_item.parity_cnt,
+                                     s_item.cell_size,
+                                     s_item.failed_idx, s_item.failed_cnt);
+                }
+            }
             break;
 
         case GPU_OP_COMPRESS_LZ4:
@@ -201,11 +244,11 @@ __global__ void persistent_kernel(
 
         /* ── Mark result as ready (visible to CPU) ────────────────── */
         if (tid == 0) {
-            result->ticket = my_tail; /* Generation counter */
-            item->op_type = GPU_OP_INVALID; /* Free slot for next use */
-            __threadfence_system(); /* Ensure all result fields visible before READY */
+            result->ticket = my_tail;
+            item->op_type = GPU_OP_INVALID;
+            __threadfence_system();
             result->status = GPU_RESULT_READY;
-            __threadfence_system(); /* Ensure READY is visible to CPU */
+            __threadfence_system();
         }
         __syncthreads();
     }
@@ -228,6 +271,7 @@ int gpu_engine_init(gpu_engine_t **engine_out)
 
     /* Initialize subsystems (must happen before kernel launch) */
     gpu_csum_init();
+    gpu_ec_init_gf_tables();
 
     gpu_engine_t *eng = (gpu_engine_t *)calloc(1, sizeof(gpu_engine_t));
     if (!eng) return -1;
@@ -270,9 +314,10 @@ int gpu_engine_init(gpu_engine_t **engine_out)
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
-    /* Launch 1 block per SM — balances throughput vs. polling overhead (H-7).
-     * Each block has 128 threads for cooperative EC/compress execution. */
-    num_blocks = prop.multiProcessorCount;
+    /* Launch 4 blocks — enough for queue throughput, leaves 30 SMs free
+     * for direct kernel launches (EC multi-SM) and the PCIe copy engine.
+     * Using all 34 SMs degraded H2D/D2H bandwidth by 50% (H-7 revised). */
+    num_blocks = 4;
 
     /* Get device pointers for mapped memory */
     CUDA_CHECK(cudaHostGetDevicePointer(&d_queue, eng->queue, 0));
@@ -284,17 +329,16 @@ int gpu_engine_init(gpu_engine_t **engine_out)
     /* Clear any residual CUDA errors before launch check */
     cudaGetLastError();
 
-    /* Dynamic shared memory for nvCOMPDx compression scratch buffers.
-     * Without nvCOMPDx, no extra shared memory is needed. */
+    /* Dynamic shared memory: minimum 32KB for CRC cooperative tiling,
+     * or 48KB when nvCOMPDx is enabled for LZ4 scratch buffers. */
+    shmem_bytes = 32 * 1024;  /* 32 KB — CRC cooperative tile buffer */
 #ifdef USE_NVCOMPDX
-    /* Query shared memory requirements from nvCOMPDx at runtime.
-     * We allocate enough for the larger of compress/decompress. */
     shmem_bytes = 48 * 1024;  /* 48 KB — conservative for LZ4 warp-level */
+#endif
     /* Ensure the GPU can support this amount of dynamic shared memory */
     cudaFuncSetAttribute(persistent_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)shmem_bytes);
-#endif
 
     persistent_kernel<<<num_blocks, threads_per_block, shmem_bytes, eng->stream>>>(
         d_queue, d_results, d_head, d_tail, d_shutdown);

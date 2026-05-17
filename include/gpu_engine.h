@@ -69,6 +69,10 @@ typedef struct {
     uint32_t            stripe_cnt;     /* Number of data stripes (k) */
     uint32_t            parity_cnt;     /* Number of parity stripes (p) */
     size_t              cell_size;      /* Size of each stripe cell in bytes */
+
+    /* EC decode fields (used with GPU_OP_EC_DECODE) */
+    uint32_t            failed_idx[2];  /* Indices of failed data stripes (max 2) */
+    uint32_t            failed_cnt;     /* Number of failed stripes (1 or 2) */
 } gpu_work_item_t;
 
 /* ── Result slot (written by GPU, read by CPU) ─────────────────────────── */

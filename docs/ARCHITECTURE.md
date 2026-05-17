@@ -90,12 +90,27 @@ Implements CRC32C (Castagnoli polynomial, iSCSI-compatible) and SHA256 as CUDA `
 
 ### Erasure Coding (`gpu_ec.cu`)
 
-Implements RAID-6 compatible parity generation using Galois Field GF(2^8) arithmetic.
+Implements RAID-6 compatible parity generation and data reconstruction using Galois Field GF(2^8) arithmetic.
+
+#### EC Encode (Parity Generation)
 
 - **P-Parity**: Standard XOR across data stripes (RAID-5 compatible)
 - **Q-Parity**: Horner's method with GF(2^8) multiplication by generator `g=2`, using irreducible polynomial `0x11B` (ISA-L / Linux RAID-6 compatible)
 - **Vectorized**: Uses `uint4` (128-bit) loads/stores for memory throughput. Scalar tail loop handles non-16-aligned cell sizes.
 - **Block-cooperative**: All 128 threads in a block participate in parallel stripe processing.
+
+#### EC Decode (Data Reconstruction)
+
+Reconstructs 1 or 2 failed data stripes from P and Q parity:
+
+- **Single failure**: Reconstructed from P parity via XOR syndrome: `D_failed = P ⊕ Σ(surviving stripes)`
+- **Double failure**: Solves a 2x2 system over GF(2^8) using both P and Q syndromes:
+  - `S_P = P ⊕ Σ(surviving)` — XOR syndrome
+  - `S_Q = Q ⊕ Σ(2^s · surviving[s])` — weighted syndrome
+  - `D_y = (S_Q ⊕ g_x · S_P) · (g_y ⊕ g_x)^(-1)` — GF(2^8) division
+  - `D_x = S_P ⊕ D_y`
+- **GF(2^8) arithmetic**: Uses direct bitwise multiplication (`gf_mul_bitwise`) and Fermat's little theorem inversion (`gf_inv_direct`) — no lookup tables needed, avoiding constant memory dependency
+- **L1 cache bypass**: All data reads use `__ldcg()` (load cached-global) to bypass L1 cache. This is **essential** in persistent kernels where host-side `cudaMemset` operations on failed stripes may not be visible through stale L1 entries
 
 ### Compression (`gpu_comp.cu`)
 
@@ -280,5 +295,10 @@ Measured on NVIDIA RTX 2060 SUPER (8 GB, 34 SMs, sm_75):
 > All data is pre-resident on the GPU. PCIe 3.0 x16 is ~15.75 GB/s; end-to-end
 > throughput including host↔device transfer will be PCIe-limited.
 >
-> **\*** LZ4 compress/decompress running in memcpy stub mode (nvCOMPDx not installed).
-> IOPS numbers reflect dispatch throughput only.
+> **\*** LZ4 compress/decompress running in **memcpy stub mode**. The nvCOMPDx
+> LZ4 device-side API is defined in headers (MathDx 25.06+), but the
+> pre-compiled `libnvcompdx.fatbin` only ships **ANS** algorithm
+> implementations — no LZ4 symbols are present.  IOPS numbers reflect
+> GPU VRAM copy speed with zero actual compression. Real LZ4 requires a
+> future MathDx release that includes LZ4 in the fatbin, or use of
+> `nvJitLink` for runtime LTO compilation.

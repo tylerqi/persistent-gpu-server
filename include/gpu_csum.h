@@ -48,6 +48,12 @@ void gpu_csum_init(void);
  */
 uint32_t cpu_crc32c(const void *data, size_t len);
 
+/**
+ * CPU reference SHA256 for verification.
+ * Uses a simple software implementation.
+ */
+void cpu_sha256(const void *data, size_t len, uint8_t hash_out[32]);
+
 #ifdef __cplusplus
 }
 #endif

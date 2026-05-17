@@ -148,12 +148,13 @@ int main(void)
     const int TP_WARMUP_SEC   = 3;
 
     /* ── Helper macro for running a benchmark ─────────────────────── */
-    /* Latency: 128 threads, each does local_N submit_and_wait ops.
+    /* Latency: num_threads_param threads, each does local_N submit_and_wait ops.
      * Uses submit_and_wait() which handles queue-full + backoff internally.
-     * Throughput: 128 threads saturating the engine for TP_DURATION_SEC. */
-#define BENCHMARK_WORKLOAD(name_label, op, d_data_arr, d_len, d_comp_out_arr, comp_out_size, test_N) do { \
+     * Throughput: num_threads_param threads saturating the engine for TP_DURATION_SEC.
+     * Use fewer threads for heavy workloads (LZ4, EC) to avoid timeout cascades. */
+#define BENCHMARK_WORKLOAD(name_label, op, d_data_arr, d_len, d_comp_out_arr, comp_out_size, test_N, num_threads_param) do { \
     printf("--- Starting workload: %s ---\n", name_label); fflush(stdout); \
-    const int num_threads = 128; \
+    const int num_threads = num_threads_param; \
     int local_N = test_N / num_threads; \
     int actual_N = local_N * num_threads; \
     double *lat_arr = (double *)malloc(sizeof(double) * actual_N); \
@@ -256,15 +257,17 @@ int main(void)
     printf("--- Finished workload: %s ---\n", name_label); fflush(stdout); \
 } while(0)
 
-    /* Run the benchmarks — reduced latency samples for faster turnaround */
-    BENCHMARK_WORKLOAD("NOP", GPU_OP_NOP, d_null, 0, d_null, 0, 5000);
-    BENCHMARK_WORKLOAD("4KB CRC32C", GPU_OP_CRC32C, d_data_4k, size_4k, d_null, 0, 2560);
-    BENCHMARK_WORKLOAD("1MB CRC32C", GPU_OP_CRC32C, d_data_1m, size_1m, d_null, 0, 256);
-    BENCHMARK_WORKLOAD("1MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_1m, size_1m, d_comp_out, size_1m*2, 256);
-    BENCHMARK_WORKLOAD("1MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out, size_1m*2, d_data_1m, size_1m, 256);
-    BENCHMARK_WORKLOAD("4MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_4m, size_4m, d_comp_out_4m, size_4m*2, 256);
-    BENCHMARK_WORKLOAD("4MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out_4m, size_4m*2, d_data_4m, size_4m, 256);
-    BENCHMARK_WORKLOAD("1MB EC 4+2 Encode", GPU_OP_EC_ENCODE, d_data_1m, size_1m, d_comp_out, size_1m*2, 256);
+    /* Run the benchmarks — reduced latency samples for faster turnaround.
+     * Thread counts: 128 for lightweight ops (NOP, CRC32C),
+     * 16 for heavy ops (LZ4, EC) to avoid GPU queue saturation + timeouts. */
+    BENCHMARK_WORKLOAD("NOP", GPU_OP_NOP, d_null, 0, d_null, 0, 5000, 128);
+    BENCHMARK_WORKLOAD("4KB CRC32C", GPU_OP_CRC32C, d_data_4k, size_4k, d_null, 0, 2560, 128);
+    BENCHMARK_WORKLOAD("1MB CRC32C", GPU_OP_CRC32C, d_data_1m, size_1m, d_null, 0, 256, 128);
+    BENCHMARK_WORKLOAD("1MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_1m, size_1m, d_comp_out, size_1m*2, 256, 16);
+    BENCHMARK_WORKLOAD("1MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out, size_1m*2, d_data_1m, size_1m, 256, 16);
+    BENCHMARK_WORKLOAD("4MB LZ4 Compress", GPU_OP_COMPRESS_LZ4, d_data_4m, size_4m, d_comp_out_4m, size_4m*2, 256, 8);
+    BENCHMARK_WORKLOAD("4MB LZ4 Decompress", GPU_OP_DECOMPRESS_LZ4, d_comp_out_4m, size_4m*2, d_data_4m, size_4m, 256, 8);
+    BENCHMARK_WORKLOAD("1MB EC 4+2 Encode", GPU_OP_EC_ENCODE, d_data_1m, size_1m, d_comp_out, size_1m*2, 256, 16);
 
     gpu_engine_fini(eng);
 
