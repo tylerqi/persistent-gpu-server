@@ -34,4 +34,22 @@ int gpu_mem_copy_d2h(void *dst, const void *src, size_t size)
     return (err == cudaSuccess) ? 0 : -1;
 }
 
+int gpu_engine_register_host_mem(void *ptr, size_t size)
+{
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+int gpu_engine_unregister_host_mem(void *ptr)
+{
+    cudaError_t err = cudaHostUnregister(ptr);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+int gpu_engine_get_device_pointer(void *host_ptr, void **dev_ptr)
+{
+    cudaError_t err = cudaHostGetDevicePointer(dev_ptr, host_ptr, 0);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
 } /* extern "C" */

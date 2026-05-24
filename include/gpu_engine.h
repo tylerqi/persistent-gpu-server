@@ -157,6 +157,32 @@ int gpu_engine_submit_and_wait(gpu_engine_t *engine, gpu_work_item_t *item,
 void gpu_engine_get_metrics(gpu_engine_t *engine, gpu_engine_metrics_t *metrics);
 
 /**
+ * Register host memory for zero-copy GPU access.
+ *
+ * @param ptr   Host memory pointer (page-aligned)
+ * @param size  Size in bytes
+ * @return 0 on success, negative error code on failure
+ */
+int gpu_engine_register_host_mem(void *ptr, size_t size);
+
+/**
+ * Unregister host memory previously registered via gpu_engine_register_host_mem.
+ *
+ * @param ptr   Host memory pointer
+ * @return 0 on success, negative error code on failure
+ */
+int gpu_engine_unregister_host_mem(void *ptr);
+
+/**
+ * Get device pointer for registered host memory.
+ *
+ * @param host_ptr   Registered host memory pointer
+ * @param dev_ptr    Out parameter to receive the device pointer
+ * @return 0 on success, negative error code on failure
+ */
+int gpu_engine_get_device_pointer(void *host_ptr, void **dev_ptr);
+
+/**
  * Get the work item from the queue (for reading results like CRC).
  * Only valid after gpu_engine_poll() returns 1.
  *

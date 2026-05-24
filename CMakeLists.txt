@@ -18,7 +18,7 @@ find_package(CUDAToolkit REQUIRED)
 
 # ── CUDA flags ───────────────────────────────────────────────────────────
 # --allow-unsupported-compiler: needed for GCC 15+ with nvcc 12.9
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -allow-unsupported-compiler")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -allow-unsupported-compiler -include ${CMAKE_CURRENT_SOURCE_DIR}/cuda_glibc_compat.h")
 # Generate native SASS for direct execution
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH}")
 # Disable CMake's auto-gencode since we handle it manually
