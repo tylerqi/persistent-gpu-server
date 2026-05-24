@@ -410,7 +410,7 @@ static int test_cpu_decode_crosscheck(void)
 
     free(orig_0); free(orig_1); free(orig_3); free(p_parity); free(q_parity);
     for (int i = 0; i < k; i++) free(h_data[i]);
-    TEST_PASS("cpu_decode_crosscheck (single failure)");
+    TEST_PASS("cpu_decode_crosscheck (single + double failure)");
     return 0;
 }
 

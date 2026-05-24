@@ -36,9 +36,13 @@ int gpu_ec_xor_parity(void **data_ptrs, int num_stripes, size_t stripe_len,
 
     /* Copy pointer array to device */
     uint8_t **d_ptrs;
-    cudaMalloc(&d_ptrs, sizeof(uint8_t *) * num_stripes);
-    cudaMemcpy(d_ptrs, data_ptrs, sizeof(uint8_t *) * num_stripes,
-               cudaMemcpyHostToDevice);
+    if (cudaMalloc(&d_ptrs, sizeof(uint8_t *) * num_stripes) != cudaSuccess)
+        return -1;
+    if (cudaMemcpy(d_ptrs, data_ptrs, sizeof(uint8_t *) * num_stripes,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d_ptrs);
+        return -1;
+    }
 
     int threads = 256;
     int blocks = (int)((stripe_len + threads - 1) / threads);
@@ -46,15 +50,18 @@ int gpu_ec_xor_parity(void **data_ptrs, int num_stripes, size_t stripe_len,
     /* Use a dedicated stream instead of cudaDeviceSynchronize() to avoid
      * deadlocking with the persistent kernel running on another stream. */
     cudaStream_t stream;
-    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        cudaFree(d_ptrs);
+        return -1;
+    }
 
     ec_xor_parity_kernel<<<blocks, threads, 0, stream>>>(
         d_ptrs, num_stripes, stripe_len, (uint8_t *)parity_out);
 
-    cudaStreamSynchronize(stream);
+    cudaError_t err = cudaStreamSynchronize(stream);
     cudaStreamDestroy(stream);
     cudaFree(d_ptrs);
-    return 0;
+    return (err == cudaSuccess) ? 0 : -1;
 }
 
 /* Forward declarations of GF(2^8) helpers (defined below) */
@@ -157,7 +164,11 @@ int gpu_ec_encode_multi_sm(void **d_ec_ptrs, void **d_parity_ptrs,
         par[0],par[1],par[2],par[3],
         stripe_cnt, parity_cnt, cell_size);
 
-    /* No cudaMalloc/cudaFree — all pointers passed as kernel arguments */
+    /* Check for kernel launch errors */
+    if (cudaGetLastError() != cudaSuccess) return -1;
+
+    /* No cudaMalloc/cudaFree — all pointers passed as kernel arguments.
+     * Caller must synchronize 'stream' before reading parity results. */
     return 0;
 }
 
@@ -284,7 +295,8 @@ __constant__ uint8_t gf_inv_table[256];
 static uint8_t h_gf_exp[512];
 static uint8_t h_gf_log[256];
 static uint8_t h_gf_inv[256];
-static int gf_tables_initialized = 0;
+static volatile int gf_host_ready = 0;
+static volatile int gf_gpu_ready = 0;
 
 /* Host-side GF(2^8) multiply for table generation */
 static uint8_t h_gf_mul(uint8_t a, uint8_t b)
@@ -306,43 +318,73 @@ static uint8_t h_gf_mul(uint8_t a, uint8_t b)
 __constant__ uint8_t gf_pow2_table[16];
 static uint8_t h_gf_pow2[16];
 
-void gpu_ec_init_gf_tables(void)
+/* Build host-side GF(2^8) tables only (no CUDA calls).
+ * Thread-safe via atomic CAS — only one thread builds. */
+static void ensure_host_gf_tables(void)
 {
-    if (gf_tables_initialized) return;
+    if (gf_host_ready) return;
 
-    /* Build exp/log tables using generator g=3 (PRIMITIVE root of GF(2^8)/0x11B).
-     * Generator g=2 has order 51 and is NOT primitive — it only covers 51 of 255
-     * non-zero elements, making the log table incomplete. */
-    h_gf_exp[0] = 1;
-    for (int i = 1; i < 512; i++) {
-        h_gf_exp[i] = h_gf_mul(h_gf_exp[i - 1], 3);
+    static volatile int building = 0;
+    if (__sync_bool_compare_and_swap(&building, 0, 1)) {
+        /* Build exp/log tables using generator g=3 (PRIMITIVE root of GF(2^8)/0x11B).
+         * Generator g=2 has order 51 and is NOT primitive — it only covers 51 of 255
+         * non-zero elements, making the log table incomplete. */
+        h_gf_exp[0] = 1;
+        for (int i = 1; i < 512; i++) {
+            h_gf_exp[i] = h_gf_mul(h_gf_exp[i - 1], 3);
+        }
+        memset(h_gf_log, 0, sizeof(h_gf_log));
+        for (int i = 0; i < 255; i++) {
+            h_gf_log[h_gf_exp[i]] = (uint8_t)i;
+        }
+
+        /* Build inverse table: inv[x] = x^254 = exp[254 - log[x]] */
+        h_gf_inv[0] = 0;
+        for (int i = 1; i < 256; i++) {
+            h_gf_inv[i] = h_gf_exp[255 - h_gf_log[i]];
+        }
+
+        /* Build pow2 table: pow2[i] = 2^i in GF(2^8)/0x11B.
+         * These are the encoding coefficients used by the Horner Q-parity method. */
+        h_gf_pow2[0] = 1;
+        for (int i = 1; i < 16; i++) {
+            h_gf_pow2[i] = h_gf_mul(h_gf_pow2[i - 1], 2);
+        }
+
+        __sync_synchronize();
+        gf_host_ready = 1;
+    } else {
+        /* Another thread is building — spin until done */
+        while (!gf_host_ready) __sync_synchronize();
     }
-    memset(h_gf_log, 0, sizeof(h_gf_log));
-    for (int i = 0; i < 255; i++) {
-        h_gf_log[h_gf_exp[i]] = (uint8_t)i;
-    }
-
-    /* Build inverse table: inv[x] = x^254 = exp[254 - log[x]] */
-    h_gf_inv[0] = 0;
-    for (int i = 1; i < 256; i++) {
-        h_gf_inv[i] = h_gf_exp[255 - h_gf_log[i]];
-    }
-
-    /* Build pow2 table: pow2[i] = 2^i in GF(2^8)/0x11B.
-     * These are the encoding coefficients used by the Horner Q-parity method. */
-    h_gf_pow2[0] = 1;
-    for (int i = 1; i < 16; i++) {
-        h_gf_pow2[i] = h_gf_mul(h_gf_pow2[i - 1], 2);
-    }
-
-    cudaMemcpyToSymbol(gf_exp_table, h_gf_exp, sizeof(h_gf_exp));
-    cudaMemcpyToSymbol(gf_log_table, h_gf_log, sizeof(h_gf_log));
-    cudaMemcpyToSymbol(gf_inv_table, h_gf_inv, sizeof(h_gf_inv));
-    cudaMemcpyToSymbol(gf_pow2_table, h_gf_pow2, sizeof(h_gf_pow2));
-
-    gf_tables_initialized = 1;
 }
 
+/* Initialize GF tables on GPU. Thread-safe, idempotent.
+ * Calls ensure_host_gf_tables() first, then uploads to __constant__ memory. */
+void gpu_ec_init_gf_tables(void)
+{
+    ensure_host_gf_tables();
+
+    if (gf_gpu_ready) return;
+
+    static volatile int uploading = 0;
+    if (__sync_bool_compare_and_swap(&uploading, 0, 1)) {
+        cudaMemcpyToSymbol(gf_exp_table, h_gf_exp, sizeof(h_gf_exp));
+        cudaMemcpyToSymbol(gf_log_table, h_gf_log, sizeof(h_gf_log));
+        cudaMemcpyToSymbol(gf_inv_table, h_gf_inv, sizeof(h_gf_inv));
+        cudaMemcpyToSymbol(gf_pow2_table, h_gf_pow2, sizeof(h_gf_pow2));
+
+        __sync_synchronize();
+        gf_gpu_ready = 1;
+    } else {
+        while (!gf_gpu_ready) __sync_synchronize();
+    }
+}
+
+/* Device-side GF(2^8) operations via exp/log/pow2 tables in __constant__ memory.
+ * NOTE: Currently unused — device_ec_decode uses gf_mul_bitwise() and gf_inv_direct()
+ * to avoid __constant__ memory dependency issues with separable compilation.
+ * Retained for potential future optimization of non-persistent kernel decode paths. */
 /* Device-side GF(2^8) multiply via exp/log tables (uses g=3 as generator) */
 __device__ __forceinline__ uint8_t gf_mul_full(uint8_t a, uint8_t b)
 {
@@ -433,17 +475,32 @@ __device__ void device_ec_decode(void *const *ec_ptrs, void *const *parity_ptrs,
     if (failed_cnt == 0 || cell_size == 0) return;
 
     if (failed_cnt == 1) {
-        /* ── Single failure: reconstruct from P parity ──────────── */
+        /* ── Single failure: reconstruct from P parity (vectorized) ── */
         uint32_t fx = failed_idx[0];
-        uint8_t *out = (uint8_t *)ec_ptrs[fx];
-        const uint8_t *p_data = (const uint8_t *)parity_ptrs[0];
+        size_t vec_len = cell_size / sizeof(uint4);
+        size_t tail_start = vec_len * sizeof(uint4);
 
-        for (size_t i = threadIdx.x; i < cell_size; i += blockDim.x) {
-            uint8_t val = __ldcg(&p_data[i]);
+        /* Vectorized main loop (16 bytes per iteration) */
+        uint4 *out_vec = (uint4 *)ec_ptrs[fx];
+        for (size_t i = threadIdx.x; i < vec_len; i += blockDim.x) {
+            uint4 val = ((const uint4 *)parity_ptrs[0])[i];
             for (uint32_t s = 0; s < stripe_cnt; s++) {
                 if (s != fx) {
-                    val ^= __ldcg(&((const uint8_t *)ec_ptrs[s])[i]);
+                    uint4 sv = ((const uint4 *)ec_ptrs[s])[i];
+                    val.x ^= sv.x; val.y ^= sv.y;
+                    val.z ^= sv.z; val.w ^= sv.w;
                 }
+            }
+            out_vec[i] = val;
+        }
+
+        /* Scalar tail for non-16-aligned cell_size */
+        uint8_t *out = (uint8_t *)ec_ptrs[fx];
+        for (size_t i = tail_start + threadIdx.x; i < cell_size; i += blockDim.x) {
+            uint8_t val = ((const uint8_t *)parity_ptrs[0])[i];
+            for (uint32_t s = 0; s < stripe_cnt; s++) {
+                if (s != fx)
+                    val ^= ((const uint8_t *)ec_ptrs[s])[i];
             }
             out[i] = val;
         }
@@ -453,41 +510,36 @@ __device__ void device_ec_decode(void *const *ec_ptrs, void *const *parity_ptrs,
         uint32_t fy = failed_idx[1];
         if (fx > fy) { uint32_t t = fx; fx = fy; fy = t; }
 
+        /* Precompute GF(2^8) power-of-2 coefficients once per decode
+         * (eliminates O(k²) recomputation in the inner byte loop). */
+        uint8_t gs_table[16];
+        gs_table[0] = 1;
+        for (uint32_t s = 1; s < stripe_cnt; s++)
+            gs_table[s] = gf_mul2_byte(gs_table[s - 1]);
+
+        uint8_t g_x = gs_table[fx];
+        uint8_t g_y = gs_table[fy];
+        uint8_t coeff = gf_inv_direct(g_y ^ g_x);
+
         uint8_t *out_x = (uint8_t *)ec_ptrs[fx];
         uint8_t *out_y = (uint8_t *)ec_ptrs[fy];
         const uint8_t *p_data = (const uint8_t *)parity_ptrs[0];
         const uint8_t *q_data = (const uint8_t *)parity_ptrs[1];
 
-        /* Compute pow2 coefficients: 2^fx, 2^fy */
-        uint8_t g_x = 1;
-        for (uint32_t j = 0; j < fx; j++) g_x = gf_mul2_byte(g_x);
-        uint8_t g_y = 1;
-        for (uint32_t j = 0; j < fy; j++) g_y = gf_mul2_byte(g_y);
-
-        uint8_t coeff = gf_inv_direct(g_y ^ g_x);
-
         for (size_t i = threadIdx.x; i < cell_size; i += blockDim.x) {
-            /* Use __ldcg (load cached-global, bypass L1) for all data reads.
-             * Essential in persistent kernels: data buffers may have been
-             * modified by host-side operations (cudaMemset) on a different
-             * stream, and L1 cache may contain stale entries. */
-
             /* P syndrome: S_P = P ⊕ all surviving stripes */
-            uint8_t s_p = __ldcg(&p_data[i]);
+            uint8_t s_p = p_data[i];
             for (uint32_t s = 0; s < stripe_cnt; s++) {
-                if (s != fx && s != fy) {
-                    s_p ^= __ldcg(&((const uint8_t *)ec_ptrs[s])[i]);
-                }
+                if (s != fx && s != fy)
+                    s_p ^= ((const uint8_t *)ec_ptrs[s])[i];
             }
 
             /* Q syndrome: S_Q = Q ⊕ Σ(2^s · surviving[s]) */
-            uint8_t s_q = __ldcg(&q_data[i]);
+            uint8_t s_q = q_data[i];
             for (uint32_t s = 0; s < stripe_cnt; s++) {
-                if (s != fx && s != fy) {
-                    uint8_t gs = 1;
-                    for (uint32_t j = 0; j < s; j++) gs = gf_mul2_byte(gs);
-                    s_q ^= gf_mul_bitwise(gs, __ldcg(&((const uint8_t *)ec_ptrs[s])[i]));
-                }
+                if (s != fx && s != fy)
+                    s_q ^= gf_mul_bitwise(gs_table[s],
+                                          ((const uint8_t *)ec_ptrs[s])[i]);
             }
 
             /* Solve: D_y = (S_Q ⊕ g_x · S_P) * (g_y ⊕ g_x)^(-1) */
@@ -515,7 +567,8 @@ void cpu_ec_decode(const void **ec_ptrs, const void **parity_ptrs,
                    const int *failed_idx, int failed_cnt,
                    void **out_ptrs)
 {
-    gpu_ec_init_gf_tables();
+    /* CPU-only table init — no CUDA calls needed for reference decode */
+    ensure_host_gf_tables();
 
     if (failed_cnt == 1) {
         int fx = failed_idx[0];
@@ -532,10 +585,16 @@ void cpu_ec_decode(const void **ec_ptrs, const void **parity_ptrs,
     } else if (failed_cnt == 2 && parity_cnt >= 2) {
         int fx = failed_idx[0];
         int fy = failed_idx[1];
-        if (fx > fy) { int t = fx; fx = fy; fy = t; }
-
+        /* Track output pointers BEFORE swapping indices so they follow
+         * the caller's failed_idx order, not the sorted order. */
         uint8_t *out_x = (uint8_t *)out_ptrs[0];
         uint8_t *out_y = (uint8_t *)out_ptrs[1];
+        if (fx > fy) {
+            int t = fx; fx = fy; fy = t;
+            /* Swap outputs to match: out_x still receives D_fx data */
+            uint8_t *tp = out_x; out_x = out_y; out_y = tp;
+        }
+
         const uint8_t *p_data = (const uint8_t *)parity_ptrs[0];
         const uint8_t *q_data = (const uint8_t *)parity_ptrs[1];
 

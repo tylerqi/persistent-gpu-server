@@ -58,8 +58,6 @@ struct gpu_buffers {
     /* EC test (4 data + 2 parity) */
     void *ec_data[4];   /* 1MB each */
     void *ec_parity[2]; /* 1MB each */
-    /* EC decode needs separate output buffer for reconstructed data */
-    void *ec_decode_out[2]; /* 1MB each (max 2 failures) */
 };
 
 /* ── Verification Tests ─────────────────────────────────────────────────── */
@@ -349,7 +347,6 @@ int main(void) {
     cudaMalloc(&buf.decomp_out, 4096);
     for (int i = 0; i < 4; i++) cudaMalloc(&buf.ec_data[i], 1024 * 1024);
     for (int i = 0; i < 2; i++) cudaMalloc(&buf.ec_parity[i], 1024 * 1024);
-    for (int i = 0; i < 2; i++) cudaMalloc(&buf.ec_decode_out[i], 1024 * 1024);
 
     /* Now init engine (launches persistent kernel) */
     gpu_engine_t *eng = NULL;
@@ -376,7 +373,6 @@ int main(void) {
     cudaFree(buf.decomp_out);
     for (int i = 0; i < 4; i++) cudaFree(buf.ec_data[i]);
     for (int i = 0; i < 2; i++) cudaFree(buf.ec_parity[i]);
-    for (int i = 0; i < 2; i++) cudaFree(buf.ec_decode_out[i]);
 
     printf("\n=== Verification %s (%d failures) ===\n", failures ? "FAILED" : "PASSED", failures);
     return failures;

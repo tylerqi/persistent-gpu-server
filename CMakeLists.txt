@@ -152,6 +152,10 @@ add_gpu_test(test_verify_all tests/test_verify_all.cu)
 add_gpu_test(test_mempool    tests/test_mempool.cu)
 add_gpu_test(test_ec_decode  tests/test_ec_decode.cu)
 add_gpu_test(test_metrics    tests/test_metrics.cu)
+add_gpu_test(test_ec_comprehensive tests/test_ec_comprehensive.cu)
+set_tests_properties(test_ec_comprehensive PROPERTIES TIMEOUT 120)
+add_gpu_test(test_ec_integration tests/test_ec_integration.cu)
+set_tests_properties(test_ec_integration PROPERTIES TIMEOUT 180)
 
 # ── Benchmarks ───────────────────────────────────────────────────────────
 add_executable(bench_csum     benchmarks/bench_csum.cu)

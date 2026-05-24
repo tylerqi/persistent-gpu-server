@@ -552,9 +552,6 @@ int main(void)
     printf("\n");
     bench_compress_e2e(eng, &ctx_comp_1m,  500, "1MB LZ4 Compress E2E");
     printf("\n");
-    bench_ec_encode_e2e(eng, d_ec_data_contig, d_ec_parity_contig,
-                        h_ec_data_contig, h_ec_parity_contig, SZ_1M, 200,
-                        "1MB EC 4+2 Encode E2E");
 
     /* ═══════════════════════════════════════════════════════════════════
      * Section 2: Multi-Thread Throughput (full path)
@@ -581,14 +578,24 @@ int main(void)
                          SZ_1M, SZ_1M * 2, NT, 10, 3,
                          "1MB LZ4 Compress E2E", mt_streams);
 
-    bench_ec_e2e_throughput(eng, mt_ec, SZ_1M, NT, 10, 3,
+    /* ── Cleanup Engine (Stop persistent kernel before direct multi-SM EC benchmarks) ── */
+    gpu_engine_fini(eng);
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * Section 3: Standalone Multi-SM EC Benchmarks (no engine needed)
+     * ═══════════════════════════════════════════════════════════════════ */
+    printf("\n─── Standalone Multi-SM EC Benchmarks (Direct Launch) ───\n\n");
+
+    bench_ec_encode_e2e(NULL, d_ec_data_contig, d_ec_parity_contig,
+                        h_ec_data_contig, h_ec_parity_contig, SZ_1M, 200,
+                        "1MB EC 4+2 Encode E2E");
+
+    bench_ec_e2e_throughput(NULL, mt_ec, SZ_1M, NT, 10, 3,
                             "1MB EC 4+2 Encode E2E", mt_streams);
 
     printf("\n");
 
     /* ── Cleanup ──────────────────────────────────────────────────────── */
-    gpu_engine_fini(eng);
-
     for (int i = 0; i < NT; i++)
         cudaStreamDestroy(mt_streams[i]);
 
