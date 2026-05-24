@@ -103,14 +103,14 @@ Implements RAID-6 compatible parity generation and data reconstruction using Gal
 
 Reconstructs 1 or 2 failed data stripes from P and Q parity:
 
-- **Single failure**: Reconstructed from P parity via XOR syndrome: `D_failed = P ⊕ Σ(surviving stripes)`
-- **Double failure**: Solves a 2x2 system over GF(2^8) using both P and Q syndromes:
+- **Single failure (Vectorized):** Reconstructed from P parity via XOR syndrome: `D_failed = P ⊕ Σ(surviving stripes)`. Vectorized using 128-bit `uint4` loads/stores to maximize memory throughput.
+- **Double failure (Optimized):** Solves a 2x2 system over GF(2^8) using both P and Q syndromes:
   - `S_P = P ⊕ Σ(surviving)` — XOR syndrome
   - `S_Q = Q ⊕ Σ(2^s · surviving[s])` — weighted syndrome
   - `D_y = (S_Q ⊕ g_x · S_P) · (g_y ⊕ g_x)^(-1)` — GF(2^8) division
   - `D_x = S_P ⊕ D_y`
-- **GF(2^8) arithmetic**: Uses direct bitwise multiplication (`gf_mul_bitwise`) and Fermat's little theorem inversion (`gf_inv_direct`) — no lookup tables needed, avoiding constant memory dependency
-- **L1 cache bypass**: All data reads use `__ldcg()` (load cached-global) to bypass L1 cache. This is **essential** in persistent kernels where host-side `cudaMemset` operations on failed stripes may not be visible through stale L1 entries
+- **GF(2^8) arithmetic**: Uses direct bitwise multiplication (`gf_mul_bitwise`) and Fermat's little theorem inversion (`gf_inv_direct`) — no lookup tables needed, avoiding constant memory dependency.
+- **Precomputed coefficients**: GF(2^8) power-of-2 coefficients are precomputed once per decode block (`gs_table`) instead of being calculated on-the-fly, reducing inner loop computational overhead.
 
 ### Compression (`gpu_comp.cu`)
 

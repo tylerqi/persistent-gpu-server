@@ -49,7 +49,7 @@ make -j$(nproc)
 
 ```bash
 cd build
-ctest --output-on-failure     # Run all 10 unit tests
+ctest --output-on-failure     # Run all 12 unit tests
 ./bench_csum                  # CRC32C benchmark
 ./bench_dispatch              # Full dispatch benchmark (128 threads, ~90s)
 ```
@@ -120,8 +120,8 @@ persistent-gpu-server/
 │   ├── gpu_comp.cu       # LZ4 compress/decompress
 │   ├── gpu_mem.cu        # Memory utilities
 │   └── gpu_mempool.cu    # Lock-free Treiber stack allocator
-├── tests/                # 10 unit tests (36 sub-tests)
-├── benchmarks/           # Throughput + latency benchmarks
+├── tests/                # 12 unit test files
+├── benchmarks/           # 8 benchmark programs
 ├── examples/             # simple_server.cu
 ├── docs/                 # Architecture & design documents
 │   ├── ARCHITECTURE.md   # System architecture

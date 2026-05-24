@@ -217,7 +217,9 @@ The CPU's `gpu_engine_poll()` reads `status` first, then acquires via `__sync_sy
 - **Padding**: Inline padding computation (no pre-processing buffer needed)
 - **Limitation**: Single-threaded execution (only `tid == 0` computes); future optimization could parallelize across threads for large payloads
 
-### 5.3 EC Parity (P + Q)
+### 5.3 EC Parity (P + Q) & Reconstruction
+
+#### 5.3.1 EC Encode (Parity Generation)
 
 **P-Parity** (XOR):
 ```
@@ -244,6 +246,29 @@ __device__ uint4 gf_mul2(uint4 val) {
 ```
 
 This processes 16 bytes (4 × uint32_t in uint4) per instruction, achieving high memory throughput.
+
+#### 5.3.2 EC Decode (Data Reconstruction)
+
+Reconstructs 1 or 2 failed data stripes from surviving data and P + Q parities.
+
+- **Single-Failure Recovery (Vectorized):**
+  When only one data stripe `fx` fails, it is reconstructed from P parity and all other surviving data stripes:
+  ```
+  D_fx = P ⊕ Σ(surviving stripes)
+  ```
+  This is vectorized on GPU using `uint4` (128-bit) loads/stores to process 16 bytes per thread iteration. A scalar tail loop handles any non-16-aligned trailing bytes.
+- **Double-Failure Recovery (Optimized):**
+  When two data stripes `fx` and `fy` fail, it solves the system:
+  ```
+  S_P = P ⊕ Σ(surviving data stripes)
+  S_Q = Q ⊕ Σ(2^s · surviving[s])
+  ```
+  Then solves for the failed stripes using GF(2^8) arithmetic:
+  ```
+  D_fy = (S_Q ⊕ g_x · S_P) · (g_y ⊕ g_x)^(-1)
+  D_fx = S_P ⊕ D_fy
+  ```
+  To maximize memory bandwidth, GF(2^8) power-of-2 coefficients are precomputed once at the start of the kernel execution (`gs_table`), eliminating the redundant $O(k^2)$ GF multiplications in the inner byte-processing loop.
 
 ### 5.4 LZ4 Compression
 
@@ -314,7 +339,7 @@ The persistent kernel must **never crash**. A `__trap()` or unhandled exception 
 
 ## 8. Testing Strategy
 
-### Unit Tests (8 tests, 31 sub-tests)
+### Unit Tests (12 tests)
 
 | Test | Coverage |
 |------|----------|
@@ -326,13 +351,21 @@ The persistent kernel must **never crash**. A `__trap()` or unhandled exception 
 | `test_compress` | LZ4 compress→decompress roundtrip integrity |
 | `test_verify_all` | Cross-verification of all operations vs. CPU golden reference |
 | `test_mempool` | Alloc/free, exhaustion, double-free detection |
+| `test_ec_decode` | EC reconstruction correctness (single and double failures) |
+| `test_metrics` | Engine metric counters correctness |
+| `test_ec_comprehensive` | Boundary alignments, GF algebraic properties, exhaustive failure combinations |
+| `test_ec_integration` | End-to-end file I/O tests with random data up to 128MB, simulated disk deletion, and GPU EC reconstruction |
 
-### Benchmarks (2 benchmarks)
+### Benchmarks
 
 | Benchmark | Measures |
 |-----------|----------|
 | `bench_csum` | Standalone CRC32C kernel throughput (CPU vs GPU) |
 | `bench_dispatch` | Persistent kernel dispatch: latency histogram + sustained throughput at 128 threads |
+| `bench_e2e` | End-to-end multi-stream persistent engine execution throughput and latency |
+| `bench_ec` | Standalone EC parity generation throughput (CPU vs GPU) |
+| `bench_ec_breakdown` | Breakdown of memory copies and GF kernel compute times |
+| `bench_h2d` | Host-to-Device transfer throughput and overhead |
 
 ## 9. Known Limitations and Future Work
 
@@ -340,13 +373,11 @@ The persistent kernel must **never crash**. A `__trap()` or unhandled exception 
 
 1. **SHA256 is single-threaded**: Only thread 0 in the block computes SHA256. For large payloads, this underutilizes the block's 128 threads.
 
-2. **EC decode not implemented**: `GPU_OP_EC_DECODE` returns `GPU_ERR_NOSYS`. Data reconstruction from P+Q parity requires syndrome calculation and Galois field inversion.
+2. **LZ4 stub mode**: Without nvCOMPDx, compression is a memcpy (1:1 ratio). The API contract is preserved but no actual compression occurs.
 
-3. **LZ4 stub mode**: Without nvCOMPDx, compression is a memcpy (1:1 ratio). The API contract is preserved but no actual compression occurs.
+3. **Single GPU**: The engine assumes one GPU device. Multi-GPU support would require per-device engine instances.
 
-4. **Single GPU**: The engine assumes one GPU device. Multi-GPU support would require per-device engine instances.
-
-5. **Fixed queue size**: 4096 slots is hardcoded. Optimal size depends on workload concurrency.
+4. **Fixed queue size**: 4096 slots is hardcoded. Optimal size depends on workload concurrency.
 
 ### Future Work
 
@@ -354,7 +385,6 @@ The persistent kernel must **never crash**. A `__trap()` or unhandled exception 
 - **Async pipeline**: Use `submit()` + `poll()` for overlapped I/O and compute
 - **Multi-queue**: Separate high-priority (checksum) and low-priority (compression) queues
 - **RDMA integration**: GPUDirect RDMA for zero-copy from NVMe to GPU memory
-- **EC decode**: Complete RAID-6 data reconstruction for single and double failures
 
 ## 10. File Reference
 
@@ -371,17 +401,17 @@ persistent-gpu-server/
 ├── src/
 │   ├── gpu_engine.cu     # Persistent kernel + submit/poll/wait (504 lines)
 │   ├── gpu_csum.cu       # CRC32C + SHA256 device implementations (254 lines)
-│   ├── gpu_ec.cu         # EC parity with GF(2^8) (166 lines)
+│   ├── gpu_ec.cu         # EC parity/decode with GF(2^8) (166 lines)
 │   ├── gpu_comp.cu       # LZ4 compress/decompress (139 lines)
 │   ├── gpu_mem.cu        # cudaMalloc/Free wrappers (38 lines)
 │   └── gpu_mempool.cu    # Lock-free Treiber stack pool (142 lines)
-├── tests/                # 8 unit test files
-├── benchmarks/           # bench_csum, bench_dispatch
+├── tests/                # 12 unit test files
+├── benchmarks/           # 8 benchmark programs (bench_csum, bench_dispatch, bench_e2e, etc.)
 ├── examples/
 │   └── simple_server.cu  # Minimal usage example
 ├── scripts/
 │   └── download_nvcompdx.sh
-└── CMakeLists.txt        # Build system (107 lines)
+└── CMakeLists.txt        # Build system
 ```
 
-**Total**: ~3,465 lines of CUDA/C++ across 23 source files.
+**Total**: ~4,500 lines of CUDA/C++ across 27 source files.
