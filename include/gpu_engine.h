@@ -73,6 +73,16 @@ typedef struct {
     /* EC decode fields (used with GPU_OP_EC_DECODE) */
     uint32_t            failed_idx[2];  /* Indices of failed data stripes (max 2) */
     uint32_t            failed_cnt;     /* Number of failed stripes (1 or 2) */
+
+    /* EC mode selection: 0=native(0x11B), 1=raid6(0x11D), 2=isal(Cauchy/0x11D) */
+    uint32_t            ec_mode;
+
+    /* ISA-L encoding/decoding matrices (used with GPU_EC_MODE_ISAL).
+     * encode_matrix: parity_cnt × stripe_cnt coefficients for encode.
+     * decode_matrix: failed_cnt × stripe_cnt coefficients for decode
+     *   (pre-computed on host via gpu_ec_make_decode_matrix). */
+    uint8_t             ec_encode_matrix[64];  /* Up to 4 parity × 16 data */
+    uint8_t             ec_decode_matrix[32];  /* Up to 2 failed × 16 data */
 } gpu_work_item_t;
 
 /* ── Result slot (written by GPU, read by CPU) ─────────────────────────── */

@@ -1,17 +1,28 @@
 /**
- * gpu_ec.cu — EC Parity on GPU
+ * gpu_ec.cu — EC Parity on GPU (Encode + Decode)
  *
- * P-Parity: Standard XOR across stripes (correct, interoperable).
- * Q-Parity: PLACEHOLDER — uses (val << 1) ^ val on 32-bit words.
- *   This is NOT real GF(2^8) multiplication. It operates on 32-bit words
- *   (crossing byte boundaries) and is non-invertible, so it CANNOT
- *   reconstruct data after a double-disk failure. For production RAID-6,
- *   replace with proper GF(2^8) tables (e.g., ISA-L compatible Cauchy matrix).
+ * P-Parity: Standard XOR across data stripes. Universally compatible with
+ *   RAID-5, ISA-L, Linux RAID-6, and DAOS.
+ *
+ * Q-Parity: Vandermonde-style encoding using GF(2^8) Horner's method with
+ *   generator g=2 and irreducible polynomial 0x11B (x^8+x^4+x^3+x+1) or 0x11D.
+ *   Q[i] = 2^0·D0[i] ⊕ 2^1·D1[i] ⊕ … ⊕ 2^(k-1)·D(k-1)[i]
+ *
+ * Compatibility note:
+ *   - ISA-L uses a Cauchy encoding matrix (not Vandermonde 2^s coefficients),
+ *     so Q parity is NOT byte-identical to ISA-L output.
+ *   - Linux RAID-6 uses irreducible polynomial 0x11D (not 0x11B),
+ *     so Q parity is byte-identical to Linux RAID-6 output when MODE_RAID6 is selected.
+ *   - P parity (XOR) is universally compatible.
+ *   - The encode/decode pair in this file is self-consistent and correct
+ *     for standalone use or as a matched GPU offload engine.
  */
 #include "gpu_ec.h"
 #include "gpu_comp.h"
 #include <cuda_runtime.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdio.h>
 
 /* ── GPU kernel: XOR parity across stripes ─────────────────────────────── */
 __global__ void ec_xor_parity_kernel(
@@ -64,9 +75,17 @@ int gpu_ec_xor_parity(void **data_ptrs, int num_stripes, size_t stripe_len,
     return (err == cudaSuccess) ? 0 : -1;
 }
 
+/* GF(2^8) reduction constants */
+#define GF_REDUCE_11B  0x1B   /* x^8+x^4+x^3+x+1 (native) */
+#define GF_REDUCE_11D  0x1D   /* x^8+x^4+x^3+x^2+1 (RAID-6, ISA-L) */
+
 /* Forward declarations of GF(2^8) helpers (defined below) */
+__device__ __forceinline__ uint4 gf_mul2_r(uint4 val, uint32_t reduce);
+__device__ __forceinline__ uint8_t gf_mul2_byte_r(uint8_t val, uint8_t reduce);
 __device__ __forceinline__ uint4 gf_mul2(uint4 val);
 __device__ __forceinline__ uint8_t gf_mul2_byte(uint8_t val);
+__device__ __forceinline__ uint8_t gf_mul_bitwise_r(uint8_t a, uint8_t b, uint8_t reduce);
+__device__ __forceinline__ uint8_t gf_inv_direct_r(uint8_t a, uint8_t reduce);
 
 /* ── Multi-SM EC Encode kernel ─────────────────────────────────────────────
  * Unlike device_ec_encode (used by the persistent kernel on 1 SM),
@@ -79,7 +98,7 @@ __global__ void ec_encode_multi_sm_kernel(
     const void *ec8, const void *ec9, const void *ec10, const void *ec11,
     const void *ec12, const void *ec13, const void *ec14, const void *ec15,
     void *par0, void *par1, void *par2, void *par3,
-    uint32_t stripe_cnt, uint32_t parity_cnt, size_t cell_size)
+    uint32_t stripe_cnt, uint32_t parity_cnt, size_t cell_size, uint32_t ec_mode)
 {
     /* Reconstruct pointer arrays from arguments */
     const void *ec_ptrs[16] = {ec0,ec1,ec2,ec3,ec4,ec5,ec6,ec7,
@@ -90,6 +109,8 @@ __global__ void ec_encode_multi_sm_kernel(
     size_t tail_start = vec_len * sizeof(uint4);
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)gridDim.x * blockDim.x;
+
+    uint32_t reduce = (ec_mode == 1 || ec_mode == 2) ? GF_REDUCE_11D : GF_REDUCE_11B;
 
     /* P-Parity: XOR across all stripes */
     if (parity_cnt >= 1) {
@@ -119,7 +140,7 @@ __global__ void ec_encode_multi_sm_kernel(
             uint4 q_val = ((const uint4 *)ec_ptrs[stripe_cnt - 1])[i];
             for (int s = (int)stripe_cnt - 2; s >= 0; s--) {
                 uint4 s_val = ((const uint4 *)ec_ptrs[s])[i];
-                q_val = gf_mul2(q_val);
+                q_val = gf_mul2_r(q_val, reduce);
                 q_val.x ^= s_val.x; q_val.y ^= s_val.y;
                 q_val.z ^= s_val.z; q_val.w ^= s_val.w;
             }
@@ -129,7 +150,7 @@ __global__ void ec_encode_multi_sm_kernel(
         for (size_t i = tail_start + gid; i < cell_size; i += stride) {
             uint8_t q = ((const uint8_t *)ec_ptrs[stripe_cnt - 1])[i];
             for (int s = (int)stripe_cnt - 2; s >= 0; s--) {
-                q = gf_mul2_byte(q);
+                q = gf_mul2_byte_r(q, reduce);
                 q ^= ((const uint8_t *)ec_ptrs[s])[i];
             }
             q_bytes[i] = q;
@@ -142,8 +163,10 @@ __global__ void ec_encode_multi_sm_kernel(
  * must already be in GPU memory. */
 int gpu_ec_encode_multi_sm(void **d_ec_ptrs, void **d_parity_ptrs,
                             int stripe_cnt, int parity_cnt, size_t cell_size,
-                            cudaStream_t stream)
+                            cudaStream_t stream, int ec_mode)
 {
+    if (ec_mode == 2) // GPU_EC_MODE_ISAL
+        return -1;
     if (!d_ec_ptrs || !d_parity_ptrs || stripe_cnt <= 0 || parity_cnt <= 0 || cell_size == 0)
         return -1;
 
@@ -162,7 +185,7 @@ int gpu_ec_encode_multi_sm(void **d_ec_ptrs, void **d_parity_ptrs,
         ec[0],ec[1],ec[2],ec[3],ec[4],ec[5],ec[6],ec[7],
         ec[8],ec[9],ec[10],ec[11],ec[12],ec[13],ec[14],ec[15],
         par[0],par[1],par[2],par[3],
-        stripe_cnt, parity_cnt, cell_size);
+        stripe_cnt, parity_cnt, cell_size, ec_mode);
 
     /* Check for kernel launch errors */
     if (cudaGetLastError() != cudaSuccess) return -1;
@@ -187,26 +210,34 @@ void cpu_ec_xor_parity(const void **data_ptrs, int num_stripes,
 }
 
 /* ── GF(2^8) Arithmetic ────────────────────────────────────────────────── */
-/* Fast parallel GF(2^8) multiplication by 2 using irreducible polynomial 0x11B.
- * This is the standard polynomial used by ISA-L, DAOS, and Linux RAID-6.
- * Reduction constant = 0x1B (lower 8 bits of 0x11B).
+/* Fast parallel GF(2^8) multiplication by 2 using a parameterized irreducible polynomial.
  * Multiplies four bytes packed into a 32-bit word, executing on uint4 vectors.
  */
-__device__ __forceinline__ uint4 gf_mul2(uint4 val)
+__device__ __forceinline__ uint4 gf_mul2_r(uint4 val, uint32_t reduce)
 {
     uint4 res;
     uint32_t mask;
-    mask = (val.x & 0x80808080) >> 7; res.x = ((val.x << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
-    mask = (val.y & 0x80808080) >> 7; res.y = ((val.y << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
-    mask = (val.z & 0x80808080) >> 7; res.z = ((val.z << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
-    mask = (val.w & 0x80808080) >> 7; res.w = ((val.w << 1) & 0xFEFEFEFE) ^ (mask * 0x1B);
+    mask = (val.x & 0x80808080) >> 7; res.x = ((val.x << 1) & 0xFEFEFEFE) ^ (mask * reduce);
+    mask = (val.y & 0x80808080) >> 7; res.y = ((val.y << 1) & 0xFEFEFEFE) ^ (mask * reduce);
+    mask = (val.z & 0x80808080) >> 7; res.z = ((val.z << 1) & 0xFEFEFEFE) ^ (mask * reduce);
+    mask = (val.w & 0x80808080) >> 7; res.w = ((val.w << 1) & 0xFEFEFEFE) ^ (mask * reduce);
     return res;
 }
 
-/* Scalar GF(2^8) multiply by 2 for tail bytes */
+/* Scalar GF(2^8) multiply by 2 using a parameterized irreducible polynomial */
+__device__ __forceinline__ uint8_t gf_mul2_byte_r(uint8_t val, uint8_t reduce)
+{
+    return (uint8_t)(((val << 1) & 0xFE) ^ ((val >> 7) * reduce));
+}
+
+__device__ __forceinline__ uint4 gf_mul2(uint4 val)
+{
+    return gf_mul2_r(val, GF_REDUCE_11B);
+}
+
 __device__ __forceinline__ uint8_t gf_mul2_byte(uint8_t val)
 {
-    return (uint8_t)(((val << 1) & 0xFE) ^ ((val >> 7) * 0x1B));
+    return gf_mul2_byte_r(val, GF_REDUCE_11B);
 }
 
 extern "C" {
@@ -218,12 +249,31 @@ extern "C" {
  */
 __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
                                  uint32_t stripe_cnt, uint32_t parity_cnt,
-                                 size_t cell_size)
+                                 size_t cell_size, uint32_t ec_mode,
+                                 const uint8_t *encode_matrix)
 {
     if (stripe_cnt == 0 || parity_cnt == 0 || cell_size == 0) return;
 
+    if (ec_mode == 2) {
+        for (uint32_t r = 0; r < parity_cnt; r++) {
+            uint8_t *out = (uint8_t *)parity_ptrs[r];
+            for (size_t i = threadIdx.x; i < cell_size; i += blockDim.x) {
+                uint8_t val = 0;
+                for (uint32_t j = 0; j < stripe_cnt; j++) {
+                    uint8_t coef = encode_matrix[r * stripe_cnt + j];
+                    val ^= gf_mul_bitwise_r(coef, ((const uint8_t *)ec_ptrs[j])[i], GF_REDUCE_11D);
+                }
+                out[i] = val;
+            }
+        }
+        return;
+    }
+
+
     size_t vec_len = cell_size / sizeof(uint4);
     size_t tail_start = vec_len * sizeof(uint4); /* Byte offset where tail begins */
+
+    uint32_t reduce = (ec_mode == 1 || ec_mode == 2) ? GF_REDUCE_11D : GF_REDUCE_11B;
 
     /* P-Parity: Simple XOR */
     if (parity_cnt >= 1) {
@@ -259,7 +309,7 @@ __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
             uint4 q_val = ((const uint4*)ec_ptrs[stripe_cnt - 1])[i];
             for (int s = (int)stripe_cnt - 2; s >= 0; s--) {
                 uint4 s_val = ((const uint4*)ec_ptrs[s])[i];
-                q_val = gf_mul2(q_val);
+                q_val = gf_mul2_r(q_val, reduce);
                 q_val.x ^= s_val.x;
                 q_val.y ^= s_val.y;
                 q_val.z ^= s_val.z;
@@ -272,7 +322,7 @@ __device__ void device_ec_encode(void *const *ec_ptrs, void *const *parity_ptrs,
         for (size_t i = tail_start + threadIdx.x; i < cell_size; i += blockDim.x) {
             uint8_t q_byte = ((const uint8_t*)ec_ptrs[stripe_cnt - 1])[i];
             for (int s = (int)stripe_cnt - 2; s >= 0; s--) {
-                q_byte = gf_mul2_byte(q_byte);
+                q_byte = gf_mul2_byte_r(q_byte, reduce);
                 q_byte ^= ((const uint8_t*)ec_ptrs[s])[i];
             }
             q_out_bytes[i] = q_byte;
@@ -296,10 +346,10 @@ static uint8_t h_gf_exp[512];
 static uint8_t h_gf_log[256];
 static uint8_t h_gf_inv[256];
 static volatile int gf_host_ready = 0;
-static volatile int gf_gpu_ready = 0;
+static pthread_once_t gf_init_once = PTHREAD_ONCE_INIT;
 
 /* Host-side GF(2^8) multiply for table generation */
-static uint8_t h_gf_mul(uint8_t a, uint8_t b)
+static uint8_t h_gf_mul_r(uint8_t a, uint8_t b, uint8_t reduce)
 {
     uint8_t result = 0;
     uint8_t hi_bit;
@@ -307,16 +357,31 @@ static uint8_t h_gf_mul(uint8_t a, uint8_t b)
         if (b & 1) result ^= a;
         hi_bit = a & 0x80;
         a <<= 1;
-        if (hi_bit) a ^= 0x1B; /* Reduce by x^8 + x^4 + x^3 + x + 1 */
+        if (hi_bit) a ^= reduce;
         b >>= 1;
     }
     return result;
 }
 
+static uint8_t h_gf_mul(uint8_t a, uint8_t b)
+{
+    return h_gf_mul_r(a, b, GF_REDUCE_11B);
+}
+
 /* Pre-computed powers of 2 for Q-parity coefficients (encoding uses g=2 in Horner).
- * pow2_table[i] = 2^i in GF(2^8)/0x11B. Only need up to 16 entries (max stripe count). */
+ * Only need up to 16 entries (max stripe count). */
 __constant__ uint8_t gf_pow2_table[16];
 static uint8_t h_gf_pow2[16];
+
+__constant__ uint8_t gf_exp_table_11d[512];
+__constant__ uint8_t gf_log_table_11d[256];
+__constant__ uint8_t gf_inv_table_11d[256];
+__constant__ uint8_t gf_pow2_table_11d[16];
+
+static uint8_t h_gf_exp_11d[512];
+static uint8_t h_gf_log_11d[256];
+static uint8_t h_gf_inv_11d[256];
+static uint8_t h_gf_pow2_11d[16];
 
 /* Build host-side GF(2^8) tables only (no CUDA calls).
  * Thread-safe via atomic CAS — only one thread builds. */
@@ -351,6 +416,45 @@ static void ensure_host_gf_tables(void)
             h_gf_pow2[i] = h_gf_mul(h_gf_pow2[i - 1], 2);
         }
 
+        /* Build 11D tables dynamically using a primitive root generator */
+        uint8_t gen_11d = 0;
+        for (int candidate = 2; candidate < 256; candidate++) {
+            h_gf_exp_11d[0] = 1;
+            int visited[256] = {0};
+            visited[1] = 1;
+            int count = 1;
+            for (int i = 1; i < 255; i++) {
+                h_gf_exp_11d[i] = h_gf_mul_r(h_gf_exp_11d[i - 1], candidate, GF_REDUCE_11D);
+                if (h_gf_exp_11d[i] != 0 && !visited[h_gf_exp_11d[i]]) {
+                    visited[h_gf_exp_11d[i]] = 1;
+                    count++;
+                }
+            }
+            if (count == 255) {
+                gen_11d = candidate;
+                /* Extend to 512 entries */
+                for (int i = 255; i < 512; i++) {
+                    h_gf_exp_11d[i] = h_gf_mul_r(h_gf_exp_11d[i - 1], gen_11d, GF_REDUCE_11D);
+                }
+                break;
+            }
+        }
+
+        memset(h_gf_log_11d, 0, sizeof(h_gf_log_11d));
+        for (int i = 0; i < 255; i++) {
+            h_gf_log_11d[h_gf_exp_11d[i]] = (uint8_t)i;
+        }
+
+        h_gf_inv_11d[0] = 0;
+        for (int i = 1; i < 256; i++) {
+            h_gf_inv_11d[i] = h_gf_exp_11d[255 - h_gf_log_11d[i]];
+        }
+
+        h_gf_pow2_11d[0] = 1;
+        for (int i = 1; i < 16; i++) {
+            h_gf_pow2_11d[i] = h_gf_mul_r(h_gf_pow2_11d[i - 1], 2, GF_REDUCE_11D);
+        }
+
         __sync_synchronize();
         gf_host_ready = 1;
     } else {
@@ -361,24 +465,68 @@ static void ensure_host_gf_tables(void)
 
 /* Initialize GF tables on GPU. Thread-safe, idempotent.
  * Calls ensure_host_gf_tables() first, then uploads to __constant__ memory. */
-void gpu_ec_init_gf_tables(void)
+static void do_init_gf_tables(void)
 {
     ensure_host_gf_tables();
 
-    if (gf_gpu_ready) return;
-
-    static volatile int uploading = 0;
-    if (__sync_bool_compare_and_swap(&uploading, 0, 1)) {
-        cudaMemcpyToSymbol(gf_exp_table, h_gf_exp, sizeof(h_gf_exp));
-        cudaMemcpyToSymbol(gf_log_table, h_gf_log, sizeof(h_gf_log));
-        cudaMemcpyToSymbol(gf_inv_table, h_gf_inv, sizeof(h_gf_inv));
-        cudaMemcpyToSymbol(gf_pow2_table, h_gf_pow2, sizeof(h_gf_pow2));
-
-        __sync_synchronize();
-        gf_gpu_ready = 1;
-    } else {
-        while (!gf_gpu_ready) __sync_synchronize();
+    cudaError_t err;
+    err = cudaMemcpyToSymbol(gf_exp_table, h_gf_exp, sizeof(h_gf_exp));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_exp_table) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
     }
+    err = cudaMemcpyToSymbol(gf_log_table, h_gf_log, sizeof(h_gf_log));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_log_table) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
+    }
+    err = cudaMemcpyToSymbol(gf_inv_table, h_gf_inv, sizeof(h_gf_inv));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_inv_table) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
+    }
+    err = cudaMemcpyToSymbol(gf_pow2_table, h_gf_pow2, sizeof(h_gf_pow2));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_pow2_table) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
+    }
+
+    /* 11D tables */
+    err = cudaMemcpyToSymbol(gf_exp_table_11d, h_gf_exp_11d, sizeof(h_gf_exp_11d));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_exp_table_11d) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
+    }
+    err = cudaMemcpyToSymbol(gf_log_table_11d, h_gf_log_11d, sizeof(h_gf_log_11d));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_log_table_11d) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
+    }
+    err = cudaMemcpyToSymbol(gf_inv_table_11d, h_gf_inv_11d, sizeof(h_gf_inv_11d));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_inv_table_11d) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
+    }
+    err = cudaMemcpyToSymbol(gf_pow2_table_11d, h_gf_pow2_11d, sizeof(h_gf_pow2_11d));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CRITICAL: cudaMemcpyToSymbol(gf_pow2_table_11d) failed: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
+        return;
+    }
+}
+
+/* Initialize GF tables on GPU. Thread-safe, idempotent.
+ * Calls ensure_host_gf_tables() first, then uploads to __constant__ memory. */
+void gpu_ec_init_gf_tables(void)
+{
+    pthread_once(&gf_init_once, do_init_gf_tables);
 }
 
 /* Device-side GF(2^8) operations via exp/log/pow2 tables in __constant__ memory.
@@ -408,41 +556,48 @@ __device__ __forceinline__ uint8_t gf_pow2_val(int n)
 
 
 /* ── Direct GF(2^8) Arithmetic (no tables, for EC decode) ──────────────── */
-/* These bypass __constant__ memory and use bitwise operations only.
- * Needed because the exp/log tables in __constant__ memory may not be
- * accessible from the persistent kernel's separable compilation context. */
+/* These bypass __constant__ memory and use bitwise operations only. */
 
-__device__ __forceinline__ uint8_t gf_mul_bitwise(uint8_t a, uint8_t b)
+__device__ __forceinline__ uint8_t gf_mul_bitwise_r(uint8_t a, uint8_t b, uint8_t reduce)
 {
     uint8_t result = 0;
     for (int i = 0; i < 8; i++) {
         if (b & 1) result ^= a;
         uint8_t hi = a & 0x80;
         a <<= 1;
-        if (hi) a ^= 0x1B;
+        if (hi) a ^= reduce;
         b >>= 1;
     }
     return result;
 }
 
-/* GF(2^8) inverse via Fermat's little theorem: a^(-1) = a^254 */
-__device__ __forceinline__ uint8_t gf_inv_direct(uint8_t a)
+__device__ __forceinline__ uint8_t gf_inv_direct_r(uint8_t a, uint8_t reduce)
 {
     if (a == 0) return 0;
-    uint8_t a2   = gf_mul_bitwise(a, a);     /* a^2 */
-    uint8_t a3   = gf_mul_bitwise(a2, a);    /* a^3 */
-    uint8_t a6   = gf_mul_bitwise(a3, a3);   /* a^6 */
-    uint8_t a7   = gf_mul_bitwise(a6, a);    /* a^7 */
-    uint8_t a14  = gf_mul_bitwise(a7, a7);   /* a^14 */
-    uint8_t a15  = gf_mul_bitwise(a14, a);   /* a^15 */
-    uint8_t a30  = gf_mul_bitwise(a15, a15); /* a^30 */
-    uint8_t a31  = gf_mul_bitwise(a30, a);   /* a^31 */
-    uint8_t a62  = gf_mul_bitwise(a31, a31); /* a^62 */
-    uint8_t a63  = gf_mul_bitwise(a62, a);   /* a^63 */
-    uint8_t a126 = gf_mul_bitwise(a63, a63); /* a^126 */
-    uint8_t a127 = gf_mul_bitwise(a126, a);  /* a^127 */
-    uint8_t a254 = gf_mul_bitwise(a127, a127); /* a^254 */
+    uint8_t a2   = gf_mul_bitwise_r(a, a, reduce);     /* a^2 */
+    uint8_t a3   = gf_mul_bitwise_r(a2, a, reduce);    /* a^3 */
+    uint8_t a6   = gf_mul_bitwise_r(a3, a3, reduce);   /* a^6 */
+    uint8_t a7   = gf_mul_bitwise_r(a6, a, reduce);    /* a^7 */
+    uint8_t a14  = gf_mul_bitwise_r(a7, a7, reduce);   /* a^14 */
+    uint8_t a15  = gf_mul_bitwise_r(a14, a, reduce);   /* a^15 */
+    uint8_t a30  = gf_mul_bitwise_r(a15, a15, reduce); /* a^30 */
+    uint8_t a31  = gf_mul_bitwise_r(a30, a, reduce);   /* a^31 */
+    uint8_t a62  = gf_mul_bitwise_r(a31, a31, reduce); /* a^62 */
+    uint8_t a63  = gf_mul_bitwise_r(a62, a, reduce);   /* a^63 */
+    uint8_t a126 = gf_mul_bitwise_r(a63, a63, reduce); /* a^126 */
+    uint8_t a127 = gf_mul_bitwise_r(a126, a, reduce);  /* a^127 */
+    uint8_t a254 = gf_mul_bitwise_r(a127, a127, reduce); /* a^254 */
     return a254;
+}
+
+__device__ __forceinline__ uint8_t gf_mul_bitwise(uint8_t a, uint8_t b)
+{
+    return gf_mul_bitwise_r(a, b, GF_REDUCE_11B);
+}
+
+__device__ __forceinline__ uint8_t gf_inv_direct(uint8_t a)
+{
+    return gf_inv_direct_r(a, GF_REDUCE_11B);
 }
 
 extern "C" {
@@ -470,9 +625,47 @@ extern "C" {
 __device__ void device_ec_decode(void *const *ec_ptrs, void *const *parity_ptrs,
                                  uint32_t stripe_cnt, uint32_t parity_cnt,
                                  size_t cell_size,
-                                 const uint32_t *failed_idx, uint32_t failed_cnt)
+                                 const uint32_t *failed_idx, uint32_t failed_cnt,
+                                 uint32_t ec_mode,
+                                 const uint8_t *decode_matrix)
 {
     if (failed_cnt == 0 || cell_size == 0) return;
+
+    uint32_t reduce = (ec_mode == 1 || ec_mode == 2) ? GF_REDUCE_11D : GF_REDUCE_11B;
+
+    if (ec_mode == 2) {
+        void *available_ptrs[16];
+        uint32_t avail_cnt = 0;
+        for (uint32_t s = 0; s < stripe_cnt; s++) {
+            int failed = 0;
+            for (uint32_t f = 0; f < failed_cnt; f++) {
+                if (failed_idx[f] == s) {
+                    failed = 1;
+                    break;
+                }
+            }
+            if (!failed) {
+                available_ptrs[avail_cnt++] = ec_ptrs[s];
+            }
+        }
+        for (uint32_t f = 0; f < failed_cnt; f++) {
+            available_ptrs[avail_cnt++] = parity_ptrs[f];
+        }
+
+        for (uint32_t f_idx = 0; f_idx < failed_cnt; f_idx++) {
+            uint32_t fid = failed_idx[f_idx];
+            uint8_t *out = (uint8_t *)ec_ptrs[fid];
+            for (size_t i = threadIdx.x; i < cell_size; i += blockDim.x) {
+                uint8_t val = 0;
+                for (uint32_t j = 0; j < stripe_cnt; j++) {
+                    uint8_t coef = decode_matrix[f_idx * stripe_cnt + j];
+                    val ^= gf_mul_bitwise_r(coef, ((const uint8_t *)available_ptrs[j])[i], GF_REDUCE_11D);
+                }
+                out[i] = val;
+            }
+        }
+        return;
+    }
 
     if (failed_cnt == 1) {
         /* ── Single failure: reconstruct from P parity (vectorized) ── */
@@ -515,11 +708,11 @@ __device__ void device_ec_decode(void *const *ec_ptrs, void *const *parity_ptrs,
         uint8_t gs_table[16];
         gs_table[0] = 1;
         for (uint32_t s = 1; s < stripe_cnt; s++)
-            gs_table[s] = gf_mul2_byte(gs_table[s - 1]);
+            gs_table[s] = gf_mul2_byte_r(gs_table[s - 1], reduce);
 
         uint8_t g_x = gs_table[fx];
         uint8_t g_y = gs_table[fy];
-        uint8_t coeff = gf_inv_direct(g_y ^ g_x);
+        uint8_t coeff = gf_inv_direct_r(g_y ^ g_x, reduce);
 
         uint8_t *out_x = (uint8_t *)ec_ptrs[fx];
         uint8_t *out_y = (uint8_t *)ec_ptrs[fy];
@@ -538,12 +731,12 @@ __device__ void device_ec_decode(void *const *ec_ptrs, void *const *parity_ptrs,
             uint8_t s_q = q_data[i];
             for (uint32_t s = 0; s < stripe_cnt; s++) {
                 if (s != fx && s != fy)
-                    s_q ^= gf_mul_bitwise(gs_table[s],
-                                          ((const uint8_t *)ec_ptrs[s])[i]);
+                    s_q ^= gf_mul_bitwise_r(gs_table[s],
+                                          ((const uint8_t *)ec_ptrs[s])[i], reduce);
             }
 
             /* Solve: D_y = (S_Q ⊕ g_x · S_P) * (g_y ⊕ g_x)^(-1) */
-            uint8_t dy = gf_mul_bitwise(s_q ^ gf_mul_bitwise(g_x, s_p), coeff);
+            uint8_t dy = gf_mul_bitwise_r(s_q ^ gf_mul_bitwise_r(g_x, s_p, reduce), coeff, reduce);
             uint8_t dx = s_p ^ dy;
 
             out_x[i] = dx;
@@ -557,18 +750,56 @@ __device__ void device_ec_decode(void *const *ec_ptrs, void *const *parity_ptrs,
 
 /* ── CPU Reference EC Decode for Verification ──────────────────────────── */
 
-static uint8_t cpu_gf_mul_ref(uint8_t a, uint8_t b)
-{
-    return h_gf_mul(a, b);
-}
-
 void cpu_ec_decode(const void **ec_ptrs, const void **parity_ptrs,
                    int stripe_cnt, int parity_cnt, size_t cell_size,
                    const int *failed_idx, int failed_cnt,
-                   void **out_ptrs)
+                   void **out_ptrs, int ec_mode)
 {
-    /* CPU-only table init — no CUDA calls needed for reference decode */
     ensure_host_gf_tables();
+
+    if (ec_mode == 2) {
+        uint8_t encode_matrix[64];
+        uint8_t decode_matrix[32];
+        gpu_ec_gen_cauchy_matrix(encode_matrix, stripe_cnt, parity_cnt);
+        if (gpu_ec_make_decode_matrix(encode_matrix, stripe_cnt, parity_cnt, failed_idx, failed_cnt, decode_matrix) != 0) {
+            return;
+        }
+        
+        const uint8_t *available[16];
+        int avail_cnt = 0;
+        for (int s = 0; s < stripe_cnt; s++) {
+            int failed = 0;
+            for (int f = 0; f < failed_cnt; f++) {
+                if (failed_idx[f] == s) {
+                    failed = 1;
+                    break;
+                }
+            }
+            if (!failed) {
+                available[avail_cnt++] = (const uint8_t *)ec_ptrs[s];
+            }
+        }
+        for (int f = 0; f < failed_cnt; f++) {
+            available[avail_cnt++] = (const uint8_t *)parity_ptrs[f];
+        }
+        
+        for (int f_idx = 0; f_idx < failed_cnt; f_idx++) {
+            uint8_t *out = (uint8_t *)out_ptrs[f_idx];
+            for (size_t i = 0; i < cell_size; i++) {
+                uint8_t val = 0;
+                for (int j = 0; j < stripe_cnt; j++) {
+                    uint8_t coef = decode_matrix[f_idx * stripe_cnt + j];
+                    val ^= h_gf_mul_r(coef, available[j][i], GF_REDUCE_11D);
+                }
+                out[i] = val;
+            }
+        }
+        return;
+    }
+
+    const uint8_t *inv_tbl = (ec_mode == 1 || ec_mode == 2) ? h_gf_inv_11d : h_gf_inv;
+    const uint8_t *pow2_tbl = (ec_mode == 1 || ec_mode == 2) ? h_gf_pow2_11d : h_gf_pow2;
+    uint8_t reduce = (ec_mode == 1 || ec_mode == 2) ? GF_REDUCE_11D : GF_REDUCE_11B;
 
     if (failed_cnt == 1) {
         int fx = failed_idx[0];
@@ -598,9 +829,9 @@ void cpu_ec_decode(const void **ec_ptrs, const void **parity_ptrs,
         const uint8_t *p_data = (const uint8_t *)parity_ptrs[0];
         const uint8_t *q_data = (const uint8_t *)parity_ptrs[1];
 
-        uint8_t g_x = h_gf_pow2[fx];
-        uint8_t g_y = h_gf_pow2[fy];
-        uint8_t coeff = h_gf_inv[g_y ^ g_x];
+        uint8_t g_x = pow2_tbl[fx];
+        uint8_t g_y = pow2_tbl[fy];
+        uint8_t coeff = inv_tbl[g_y ^ g_x];
 
         for (size_t i = 0; i < cell_size; i++) {
             uint8_t s_p = p_data[i];
@@ -611,13 +842,156 @@ void cpu_ec_decode(const void **ec_ptrs, const void **parity_ptrs,
             uint8_t s_q = q_data[i];
             for (int s = 0; s < stripe_cnt; s++) {
                 if (s != fx && s != fy)
-                    s_q ^= cpu_gf_mul_ref(h_gf_pow2[s],
-                                          ((const uint8_t *)ec_ptrs[s])[i]);
+                    s_q ^= h_gf_mul_r(pow2_tbl[s],
+                                      ((const uint8_t *)ec_ptrs[s])[i], reduce);
             }
-            uint8_t dy = cpu_gf_mul_ref(s_q ^ cpu_gf_mul_ref(g_x, s_p), coeff);
+            uint8_t dy = h_gf_mul_r(s_q ^ h_gf_mul_r(g_x, s_p, reduce), coeff, reduce);
             uint8_t dx = s_p ^ dy;
             out_x[i] = dx;
             out_y[i] = dy;
         }
     }
+}
+
+static inline uint8_t host_gf_mul_11d(uint8_t a, uint8_t b) {
+    if (a == 0 || b == 0) return 0;
+    int log_sum = (int)h_gf_log_11d[a] + (int)h_gf_log_11d[b];
+    return h_gf_exp_11d[log_sum];
+}
+
+static inline uint8_t host_gf_inv_11d(uint8_t a) {
+    return h_gf_inv_11d[a];
+}
+
+extern "C" {
+
+void gpu_ec_gen_cauchy_matrix(uint8_t *matrix, int stripe_cnt, int parity_cnt)
+{
+    ensure_host_gf_tables();
+    for (int r = 0; r < parity_cnt; r++) {
+        for (int j = 0; j < stripe_cnt; j++) {
+            uint8_t val = (uint8_t)((stripe_cnt + r) ^ j);
+            matrix[r * stripe_cnt + j] = host_gf_inv_11d(val);
+        }
+    }
+}
+
+int gpu_ec_invert_matrix(uint8_t *matrix, uint8_t *inverse, int n)
+{
+    ensure_host_gf_tables();
+    
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            inverse[i * n + j] = (i == j) ? 1 : 0;
+        }
+    }
+    
+    for (int col = 0; col < n; col++) {
+        int pivot_row = -1;
+        for (int r = col; r < n; r++) {
+            if (matrix[r * n + col] != 0) {
+                pivot_row = r;
+                break;
+            }
+        }
+        if (pivot_row == -1) {
+            return -1;
+        }
+        
+        if (pivot_row != col) {
+            for (int j = 0; j < n; j++) {
+                uint8_t tmp = matrix[col * n + j];
+                matrix[col * n + j] = matrix[pivot_row * n + j];
+                matrix[pivot_row * n + j] = tmp;
+                
+                tmp = inverse[col * n + j];
+                inverse[col * n + j] = inverse[pivot_row * n + j];
+                inverse[pivot_row * n + j] = tmp;
+            }
+        }
+        
+        uint8_t pivot = matrix[col * n + col];
+        uint8_t inv_pivot = host_gf_inv_11d(pivot);
+        for (int j = 0; j < n; j++) {
+            matrix[col * n + j] = host_gf_mul_11d(matrix[col * n + j], inv_pivot);
+            inverse[col * n + j] = host_gf_mul_11d(inverse[col * n + j], inv_pivot);
+        }
+        
+        for (int r = 0; r < n; r++) {
+            if (r == col) continue;
+            uint8_t coef = matrix[r * n + col];
+            if (coef == 0) continue;
+            for (int j = 0; j < n; j++) {
+                matrix[r * n + j] ^= host_gf_mul_11d(matrix[col * n + j], coef);
+                inverse[r * n + j] ^= host_gf_mul_11d(inverse[col * n + j], coef);
+            }
+        }
+    }
+    return 0;
+}
+
+int gpu_ec_make_decode_matrix(const uint8_t *encode_matrix,
+                              int stripe_cnt, int parity_cnt,
+                              const int *failed_idx, int failed_cnt,
+                              uint8_t *decode_matrix)
+{
+    if (stripe_cnt <= 0 || stripe_cnt > 16 || failed_cnt <= 0 || failed_cnt > stripe_cnt) {
+        return -1;
+    }
+    
+    int surv_idx[16];
+    int surv_cnt = 0;
+    for (int i = 0; i < stripe_cnt; i++) {
+        int failed = 0;
+        for (int f = 0; f < failed_cnt; f++) {
+            if (failed_idx[f] == i) {
+                failed = 1;
+                break;
+            }
+        }
+        if (!failed) {
+            if (surv_cnt >= stripe_cnt) return -1;
+            surv_idx[surv_cnt++] = i;
+        }
+    }
+    
+    for (int i = 0; i < failed_cnt; i++) {
+        if (i >= parity_cnt) return -1;
+        if (surv_cnt >= stripe_cnt) return -1;
+        surv_idx[surv_cnt++] = stripe_cnt + i;
+    }
+    
+    if (surv_cnt != stripe_cnt) {
+        return -1;
+    }
+    
+    uint8_t a_surv[256];
+    memset(a_surv, 0, sizeof(a_surv));
+    for (int r = 0; r < stripe_cnt; r++) {
+        int idx = surv_idx[r];
+        if (idx < stripe_cnt) {
+            a_surv[r * stripe_cnt + idx] = 1;
+        } else {
+            int p_idx = idx - stripe_cnt;
+            for (int c = 0; c < stripe_cnt; c++) {
+                a_surv[r * stripe_cnt + c] = encode_matrix[p_idx * stripe_cnt + c];
+            }
+        }
+    }
+    
+    uint8_t inverse[256];
+    if (gpu_ec_invert_matrix(a_surv, inverse, stripe_cnt) != 0) {
+        return -1;
+    }
+    
+    for (int f_idx = 0; f_idx < failed_cnt; f_idx++) {
+        int fid = failed_idx[f_idx];
+        for (int c = 0; c < stripe_cnt; c++) {
+            decode_matrix[f_idx * stripe_cnt + c] = inverse[fid * stripe_cnt + c];
+        }
+    }
+    
+    return 0;
+}
+
 }

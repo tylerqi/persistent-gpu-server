@@ -156,6 +156,12 @@ add_gpu_test(test_ec_comprehensive tests/test_ec_comprehensive.cu)
 set_tests_properties(test_ec_comprehensive PROPERTIES TIMEOUT 120)
 add_gpu_test(test_ec_integration tests/test_ec_integration.cu)
 set_tests_properties(test_ec_integration PROPERTIES TIMEOUT 180)
+add_gpu_test(test_ec_compat_integration tests/test_ec_compat_integration.cu)
+set_tests_properties(test_ec_compat_integration PROPERTIES TIMEOUT 180)
+
+add_gpu_test(test_overflow tests/test_overflow.cu)
+add_gpu_test(test_ec_compat tests/test_ec_compat.cu)
+add_gpu_test(test_ec_isal_compat tests/test_ec_isal_compat.cu)
 
 # ── Benchmarks ───────────────────────────────────────────────────────────
 add_executable(bench_csum     benchmarks/bench_csum.cu)

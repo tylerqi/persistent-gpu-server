@@ -58,6 +58,17 @@ __global__ void persistent_kernel(
     volatile int       *shutdown)
 {
     const int tid = threadIdx.x;
+    if (blockIdx.x == 0 && tid == 0) {
+        printf("[DEVICE DIAG] sizeof(gpu_work_item_t) = %d\n", (int)sizeof(gpu_work_item_t));
+        printf("[DEVICE DIAG] op_type offset = %d\n", (int)offsetof(gpu_work_item_t, op_type));
+        printf("[DEVICE DIAG] status offset = %d\n", (int)offsetof(gpu_work_item_t, status));
+        printf("[DEVICE DIAG] data_ptr offset = %d\n", (int)offsetof(gpu_work_item_t, data_ptr));
+        printf("[DEVICE DIAG] data_len offset = %d\n", (int)offsetof(gpu_work_item_t, data_len));
+        printf("[DEVICE DIAG] ec_ptrs offset = %d\n", (int)offsetof(gpu_work_item_t, ec_ptrs));
+        printf("[DEVICE DIAG] failed_idx offset = %d\n", (int)offsetof(gpu_work_item_t, failed_idx));
+        printf("[DEVICE DIAG] failed_cnt offset = %d\n", (int)offsetof(gpu_work_item_t, failed_cnt));
+        printf("[DEVICE DIAG] ec_mode offset = %d\n", (int)offsetof(gpu_work_item_t, ec_mode));
+    }
 
     /* Dynamic shared memory — used for CRC tiling and LZ4 scratch.
      * The kernel is launched with max(32KB, 48KB) of dynamic shmem. */
@@ -185,7 +196,8 @@ __global__ void persistent_kernel(
                 device_ec_encode((void *const *)s_item.ec_ptrs,
                                  (void *const *)s_item.parity_ptrs,
                                  s_item.stripe_cnt, s_item.parity_cnt,
-                                 s_item.cell_size);
+                                 s_item.cell_size, s_item.ec_mode,
+                                 s_item.ec_encode_matrix);
             }
             break;
 
@@ -207,7 +219,9 @@ __global__ void persistent_kernel(
                                      (void *const *)s_item.parity_ptrs,
                                      s_item.stripe_cnt, s_item.parity_cnt,
                                      s_item.cell_size,
-                                     s_item.failed_idx, s_item.failed_cnt);
+                                     s_item.failed_idx, s_item.failed_cnt,
+                                     s_item.ec_mode,
+                                     s_item.ec_decode_matrix);
                 }
             }
             break;
@@ -217,10 +231,17 @@ __global__ void persistent_kernel(
                 if (tid == 0) result->error_code = GPU_ERR_INVAL;
             } else {
                 size_t actual_out = 0;
-                device_compress_lz4((const uint8_t *)s_item.data_ptr, s_item.data_len,
-                                    (uint8_t *)s_item.comp_out_ptr, s_item.comp_max_size,
-                                    &actual_out);
-                if (tid == 0) result->actual_comp_size = actual_out;
+                int err = device_compress_lz4((const uint8_t *)s_item.data_ptr, s_item.data_len,
+                                              (uint8_t *)s_item.comp_out_ptr, s_item.comp_max_size,
+                                              &actual_out);
+                if (tid == 0) {
+                    if (err != 0) {
+                        result->error_code = err;
+                        result->actual_comp_size = 0;
+                    } else {
+                        result->actual_comp_size = actual_out;
+                    }
+                }
             }
             break;
 
@@ -229,10 +250,17 @@ __global__ void persistent_kernel(
                 if (tid == 0) result->error_code = GPU_ERR_INVAL;
             } else {
                 size_t actual_out = 0;
-                device_decompress_lz4((const uint8_t *)s_item.data_ptr, s_item.data_len,
-                                      (uint8_t *)s_item.comp_out_ptr, s_item.comp_max_size,
-                                      &actual_out);
-                if (tid == 0) result->actual_comp_size = actual_out;
+                int err = device_decompress_lz4((const uint8_t *)s_item.data_ptr, s_item.data_len,
+                                                (uint8_t *)s_item.comp_out_ptr, s_item.comp_max_size,
+                                                &actual_out);
+                if (tid == 0) {
+                    if (err != 0) {
+                        result->error_code = err;
+                        result->actual_comp_size = 0;
+                    } else {
+                        result->actual_comp_size = actual_out;
+                    }
+                }
             }
             break;
 
