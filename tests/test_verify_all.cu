@@ -66,6 +66,7 @@ static int verify_crc32c(gpu_engine_t *eng, struct gpu_buffers *buf) {
     size_t len = 1024 * 1024;
     uint8_t *h_data = alloc_host_buffer(len, 31);
     cudaMemcpy(buf->crc_data, h_data, len, cudaMemcpyHostToDevice);
+    cudaStreamSynchronize(0);
 
     gpu_work_item_t item = {};
     item.op_type = GPU_OP_CRC32C;
@@ -92,6 +93,7 @@ static int verify_crc32c(gpu_engine_t *eng, struct gpu_buffers *buf) {
 static int verify_sha256(gpu_engine_t *eng, struct gpu_buffers *buf) {
     const char *test_str = "abc";
     cudaMemcpy(buf->sha_data, test_str, 3, cudaMemcpyHostToDevice);
+    cudaStreamSynchronize(0);
 
     gpu_work_item_t item = {};
     item.op_type = GPU_OP_SHA256;
@@ -102,8 +104,14 @@ static int verify_sha256(gpu_engine_t *eng, struct gpu_buffers *buf) {
     int rc = gpu_engine_submit_and_wait(eng, &item, &res);
     if (rc != 0) TEST_FAIL("verify_sha256", "submit_and_wait failed");
 
-    if (memcmp(res.sha256_result, expected_sha256_abc, 32) != 0)
+    if (memcmp(res.sha256_result, expected_sha256_abc, 32) != 0) {
+        printf("  [DIAG] SHA256 mismatch: got ");
+        for (int i = 0; i < 32; i++) printf("%02X", res.sha256_result[i]);
+        printf("\n  expected ");
+        for (int i = 0; i < 32; i++) printf("%02X", expected_sha256_abc[i]);
+        printf("\n");
         TEST_FAIL("verify_sha256", "SHA256 hash mismatch vs known CPU vector");
+    }
 
     TEST_PASS("verify_sha256");
     return 0;
@@ -114,6 +122,7 @@ static int verify_compress_decompress(gpu_engine_t *eng, struct gpu_buffers *buf
     uint8_t *h_orig = alloc_host_buffer(len, 13);
     uint8_t *h_out = (uint8_t *)malloc(len);
     cudaMemcpy(buf->comp_data, h_orig, len, cudaMemcpyHostToDevice);
+    cudaStreamSynchronize(0);
 
     /* Compress */
     gpu_work_item_t item_c = {};
@@ -162,6 +171,7 @@ static int verify_ec_encode(gpu_engine_t *eng, struct gpu_buffers *buf) {
         h_data[i] = alloc_host_buffer(len, i * 7 + 1);
         cudaMemcpy(buf->ec_data[i], h_data[i], len, cudaMemcpyHostToDevice);
     }
+    cudaStreamSynchronize(0);
     for (int i = 0; i < (int)p; i++) {
         h_gpu_parity[i] = (uint8_t *)calloc(1, len);
         h_cpu_parity[i] = (uint8_t *)calloc(1, len);
@@ -235,6 +245,7 @@ static int verify_ec_decode(gpu_engine_t *eng, struct gpu_buffers *buf) {
         h_orig[i] = alloc_host_buffer(len, i * 11 + 3);
         cudaMemcpy(buf->ec_data[i], h_orig[i], len, cudaMemcpyHostToDevice);
     }
+    cudaStreamSynchronize(0);
 
     /* Step 1: Encode P+Q parity via persistent kernel */
     gpu_work_item_t enc = {};
@@ -255,6 +266,7 @@ static int verify_ec_decode(gpu_engine_t *eng, struct gpu_buffers *buf) {
     /* ── Sub-test A: Single failure (D2) ─────────────────────────────── */
     int fail_single = 2;
     cudaMemset(buf->ec_data[fail_single], 0, len);
+    cudaStreamSynchronize(0);
 
     gpu_work_item_t dec = {};
     dec.op_type = GPU_OP_EC_DECODE;
@@ -275,6 +287,8 @@ static int verify_ec_decode(gpu_engine_t *eng, struct gpu_buffers *buf) {
     uint8_t *h_recon = (uint8_t *)malloc(len);
     cudaMemcpy(h_recon, buf->ec_data[fail_single], len, cudaMemcpyDeviceToHost);
     if (memcmp(h_recon, h_orig[fail_single], len) != 0) {
+        printf("  [DIAG] Single failure mismatch at byte 0: got 0x%02X, expected 0x%02X\n",
+               h_recon[0], h_orig[fail_single][0]);
         free(h_recon);
         for (int i = 0; i < (int)k; i++) free(h_orig[i]);
         TEST_FAIL("verify_ec_decode", "single-failure reconstruction mismatch");
@@ -286,6 +300,7 @@ static int verify_ec_decode(gpu_engine_t *eng, struct gpu_buffers *buf) {
      * re-encode to get fresh parity) */
     for (int i = 0; i < (int)k; i++)
         cudaMemcpy(buf->ec_data[i], h_orig[i], len, cudaMemcpyHostToDevice);
+    cudaStreamSynchronize(0);
     rc = gpu_engine_submit_and_wait(eng, &enc, &res);
     if (rc != 0) {
         for (int i = 0; i < (int)k; i++) free(h_orig[i]);
@@ -295,6 +310,7 @@ static int verify_ec_decode(gpu_engine_t *eng, struct gpu_buffers *buf) {
     int fail_a = 0, fail_b = 3;
     cudaMemset(buf->ec_data[fail_a], 0, len);
     cudaMemset(buf->ec_data[fail_b], 0, len);
+    cudaStreamSynchronize(0);
 
     memset(&dec, 0, sizeof(dec));
     dec.op_type = GPU_OP_EC_DECODE;
@@ -335,6 +351,15 @@ static int verify_ec_decode(gpu_engine_t *eng, struct gpu_buffers *buf) {
 
 int main(void) {
     printf("=== Comprehensive Data Verification ===\n");
+    printf("[DIAG] sizeof(gpu_work_item_t) = %zu\n", sizeof(gpu_work_item_t));
+    printf("[DIAG] op_type offset = %zu\n", offsetof(gpu_work_item_t, op_type));
+    printf("[DIAG] status offset = %zu\n", offsetof(gpu_work_item_t, status));
+    printf("[DIAG] data_ptr offset = %zu\n", offsetof(gpu_work_item_t, data_ptr));
+    printf("[DIAG] data_len offset = %zu\n", offsetof(gpu_work_item_t, data_len));
+    printf("[DIAG] ec_ptrs offset = %zu\n", offsetof(gpu_work_item_t, ec_ptrs));
+    printf("[DIAG] failed_idx offset = %zu\n", offsetof(gpu_work_item_t, failed_idx));
+    printf("[DIAG] failed_cnt offset = %zu\n", offsetof(gpu_work_item_t, failed_cnt));
+    printf("[DIAG] ec_mode offset = %zu\n", offsetof(gpu_work_item_t, ec_mode));
 
     /* Allocate ALL GPU memory BEFORE engine init.
      * cudaMalloc triggers implicit device synchronization which will

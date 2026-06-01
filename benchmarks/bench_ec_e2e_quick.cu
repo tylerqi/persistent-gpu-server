@@ -38,7 +38,7 @@ int main() {
     /* Warmup */
     for (int i = 0; i < 5; i++) {
         cudaMemcpyAsync(d_data, h_data, K * SZ, cudaMemcpyHostToDevice, stream);
-        gpu_ec_encode_multi_sm(d_stripes, d_par, K, P, SZ, stream);
+        gpu_ec_encode_multi_sm(d_stripes, d_par, K, P, SZ, stream, GPU_EC_MODE_NATIVE);
         cudaMemcpyAsync(h_parity, d_parity, P * SZ, cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
     }
@@ -47,7 +47,7 @@ int main() {
     double t0 = now_us();
     for (int i = 0; i < ITERS; i++) {
         cudaMemcpyAsync(d_data, h_data, K * SZ, cudaMemcpyHostToDevice, stream);
-        gpu_ec_encode_multi_sm(d_stripes, d_par, K, P, SZ, stream);
+        gpu_ec_encode_multi_sm(d_stripes, d_par, K, P, SZ, stream, GPU_EC_MODE_NATIVE);
         cudaMemcpyAsync(h_parity, d_parity, P * SZ, cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
     }

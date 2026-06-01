@@ -193,9 +193,9 @@ extract_ec_table() {
     [[ -f "$f" ]] || return
     echo "| Config | Cell Size | CPU (GB/s) | GPU (GB/s) | IOPS | Speedup | Verify |"
     echo "|--------|-----------|------------|------------|------|---------|--------|"
-    grep -E "^\s+[0-9]+\+1" "$f" | while read -r line; do
+    grep -E "^\s+[0-9]+\+[12]" "$f" | while read -r line; do
         local config size cpu gpu iops speedup match
-        config=$(echo "$line" | grep -oP '^\s*\K[0-9]+\+1')
+        config=$(echo "$line" | grep -oP '^\s*\K[0-9]+\+[12]')
         size=$(echo "$line" | grep -oP '[0-9]+B')
         cpu=$(echo "$line" | grep -oP 'CPU=\K[0-9.]+')
         gpu=$(echo "$line" | grep -oP 'GPU=\K[0-9.]+')

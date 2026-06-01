@@ -71,6 +71,7 @@ static int test_single_failure(gpu_engine_t *eng, struct decode_buffers *buf)
         h_orig[i] = alloc_host_buffer(len, i * 7 + 3);
         cudaMemcpy(buf->ec_data[i], h_orig[i], len, cudaMemcpyHostToDevice);
     }
+    cudaStreamSynchronize(0);
 
     /* Step 1: Encode P+Q parity */
     gpu_work_item_t enc_item = {};
@@ -91,6 +92,7 @@ static int test_single_failure(gpu_engine_t *eng, struct decode_buffers *buf)
     /* Step 2: Simulate failure — zero stripe 1 */
     int failed = 1;
     cudaMemset(buf->ec_data[failed], 0, len);
+    cudaStreamSynchronize(0);
 
     /* Step 3: Reconstruct via EC_DECODE */
     gpu_work_item_t dec_item = {};
@@ -158,6 +160,7 @@ static int test_double_failure(gpu_engine_t *eng, struct decode_buffers *buf)
         h_orig[i] = alloc_host_buffer(len, i * 13 + 5);
         cudaMemcpy(buf->ec_data[i], h_orig[i], len, cudaMemcpyHostToDevice);
     }
+    cudaStreamSynchronize(0);
 
     /* Step 1: Encode P+Q parity */
     gpu_work_item_t enc_item = {};
@@ -179,6 +182,7 @@ static int test_double_failure(gpu_engine_t *eng, struct decode_buffers *buf)
     int fx = 0, fy = 3;
     cudaMemset(buf->ec_data[fx], 0, len);
     cudaMemset(buf->ec_data[fy], 0, len);
+    cudaStreamSynchronize(0);
 
     /* Step 3: Reconstruct via EC_DECODE */
     gpu_work_item_t dec_item = {};
@@ -260,6 +264,7 @@ static int test_double_failure_adjacent(gpu_engine_t *eng, struct decode_buffers
         h_orig[i] = alloc_host_buffer(len, i * 29 + 11);
         cudaMemcpy(buf->ec_data[i], h_orig[i], len, cudaMemcpyHostToDevice);
     }
+    cudaStreamSynchronize(0);
 
     /* Encode */
     gpu_work_item_t enc_item = {};
@@ -274,6 +279,7 @@ static int test_double_failure_adjacent(gpu_engine_t *eng, struct decode_buffers
     /* Fail D2 and D3 (adjacent) */
     cudaMemset(buf->ec_data[2], 0, len);
     cudaMemset(buf->ec_data[3], 0, len);
+    cudaStreamSynchronize(0);
 
     /* Decode */
     gpu_work_item_t dec_item = {};
@@ -362,7 +368,7 @@ static int test_cpu_decode_crosscheck(void)
 
     const void *parity_ptrs[2] = {p_parity, q_parity};
     cpu_ec_decode((const void **)h_data, parity_ptrs,
-                  k, p, len, failed_idx, 1, out_ptrs);
+                  k, p, len, failed_idx, 1, out_ptrs, GPU_EC_MODE_NATIVE);
 
     if (memcmp(h_data[0], orig_0, len) != 0) {
         free(orig_0); free(p_parity); free(q_parity);
@@ -397,7 +403,7 @@ static int test_cpu_decode_crosscheck(void)
     int failed2[2] = {1, 3};
     void *out2[2] = {h_data[1], h_data[3]};
     cpu_ec_decode((const void **)h_data, parity_ptrs,
-                  k, p, len, failed2, 2, out2);
+                  k, p, len, failed2, 2, out2, GPU_EC_MODE_NATIVE);
     
     printf("  [DIAG] CPU double decode: D1[0]=0x%02X (expected 0x%02X) D3[0]=0x%02X (expected 0x%02X)\n",
            h_data[1][0], orig_1[0], h_data[3][0], orig_3[0]);

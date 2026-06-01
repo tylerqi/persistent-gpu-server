@@ -1,5 +1,7 @@
 # Persistent GPU Storage Engine
 
+> 🌐 [中文版本](./README_zh.md)
+
 A GPU-accelerated storage data-path engine that offloads checksum, erasure coding, and compression operations to CUDA GPUs using a **persistent kernel** architecture. Designed for integration with [DAOS](https://github.com/daos-stack/daos) distributed storage.
 
 ## Key Features
@@ -10,7 +12,7 @@ A GPU-accelerated storage data-path engine that offloads checksum, erasure codin
 - **GPU-accelerated operations**:
   - CRC32C checksumming (Castagnoli, iSCSI-compatible)
   - SHA256 hashing
-  - Erasure Coding parity (RAID-6 P+Q with GF(2^8), ISA-L compatible)
+  - Erasure Coding parity (RAID-6 P+Q with GF(2^8)/0x11B, Vandermonde encoding)
   - LZ4 compression/decompression (via nvCOMPDx or stub)
 - **Lock-free GPU memory pool** — allocate device memory without deadlocking the persistent kernel
 

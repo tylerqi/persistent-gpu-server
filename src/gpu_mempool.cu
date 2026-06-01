@@ -30,7 +30,7 @@ struct gpu_mempool {
 
 #define MEMPOOL_MAX_BLOCKS 65536
 #define MEMPOOL_NULL_IDX 0xFFFF
-#define MEMPOOL_GEN_MASK 0xFFFF000000000000UL
+#define MEMPOOL_GEN_MASK 0xFFFFFFFFFFFF0000UL
 #define MEMPOOL_IDX_MASK 0x000000000000FFFFUL
 
 int gpu_mempool_create(gpu_mempool_t **pool_out, size_t block_size, uint32_t block_count)

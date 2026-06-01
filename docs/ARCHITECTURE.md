@@ -1,5 +1,7 @@
 # Architecture: Persistent GPU Storage Engine
 
+> 🌐 [中文版本](./ARCHITECTURE_zh.md)
+
 ## Overview
 
 The Persistent GPU Storage Engine is a GPU-accelerated storage data-path library designed for integration with [DAOS](https://github.com/daos-stack/daos) (Distributed Asynchronous Object Storage). It offloads computationally intensive storage operations — checksum, erasure coding, and compression — to a CUDA GPU using a **persistent kernel** architecture.
@@ -94,8 +96,8 @@ Implements RAID-6 compatible parity generation and data reconstruction using Gal
 
 #### EC Encode (Parity Generation)
 
-- **P-Parity**: Standard XOR across data stripes (RAID-5 compatible)
-- **Q-Parity**: Horner's method with GF(2^8) multiplication by generator `g=2`, using irreducible polynomial `0x11B` (ISA-L / Linux RAID-6 compatible)
+- **P-Parity**: Standard XOR across data stripes (universally compatible with RAID-5, ISA-L, Linux RAID-6, and DAOS)
+- **Q-Parity**: Vandermonde-style encoding using Horner's method with GF(2^8) multiplication by generator `g=2`, using irreducible polynomial `0x11B` (`x^8+x^4+x^3+x+1`). Note: Q parity is self-consistent but not byte-identical to ISA-L (which uses a Cauchy encoding matrix) or Linux RAID-6 (which uses polynomial `0x11D`).
 - **Vectorized**: Uses `uint4` (128-bit) loads/stores for memory throughput. Scalar tail loop handles non-16-aligned cell sizes.
 - **Block-cooperative**: All 128 threads in a block participate in parallel stripe processing.
 

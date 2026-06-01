@@ -172,6 +172,103 @@ static int test_ec_verify(void)
     return 0;
 }
 
+static inline uint8_t cpu_gf_mul2_byte(uint8_t val, int ec_mode)
+{
+    uint8_t reduce = (ec_mode == 1) ? 0x1D : 0x1B;
+    return (uint8_t)(((val << 1) & 0xFE) ^ ((val >> 7) * reduce));
+}
+
+static void cpu_ec_encode_2(const void **data_ptrs, int stripe_cnt, size_t stripe_len, void **parity_ptrs, int ec_mode)
+{
+    uint8_t **parity_ptrs_u8 = (uint8_t **)parity_ptrs;
+    const uint8_t **data_ptrs_u8 = (const uint8_t **)data_ptrs;
+
+    // P parity (XOR)
+    memset(parity_ptrs_u8[0], 0, stripe_len);
+    for (int s = 0; s < stripe_cnt; s++) {
+        for (size_t i = 0; i < stripe_len; i++) {
+            parity_ptrs_u8[0][i] ^= data_ptrs_u8[s][i];
+        }
+    }
+
+    // Q parity (Vandermonde Horner)
+    for (size_t i = 0; i < stripe_len; i++) {
+        uint8_t q = data_ptrs_u8[stripe_cnt - 1][i];
+        for (int s = stripe_cnt - 2; s >= 0; s--) {
+            q = cpu_gf_mul2_byte(q, ec_mode) ^ data_ptrs_u8[s][i];
+        }
+        parity_ptrs_u8[1][i] = q;
+    }
+}
+
+static int test_ec_n_plus_2(int k, size_t len, int ec_mode, const char *name)
+{
+    uint8_t **h_data = (uint8_t **)malloc(sizeof(uint8_t *) * k);
+    void **d_ptrs = alloc_gpu_stripes(k, len, h_data);
+
+    void *d_parity[2];
+    cudaMalloc(&d_parity[0], len);
+    cudaMalloc(&d_parity[1], len);
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    int rc = gpu_ec_encode_multi_sm(d_ptrs, d_parity, k, 2, len, stream, ec_mode);
+    cudaStreamSynchronize(stream);
+
+    if (rc != 0) {
+        cudaFree(d_parity[0]); cudaFree(d_parity[1]);
+        cudaStreamDestroy(stream);
+        free_gpu_stripes(d_ptrs, h_data, k);
+        TEST_FAIL(name, "gpu_ec_encode_multi_sm failed");
+    }
+
+    uint8_t *gpu_parity[2];
+    gpu_parity[0] = (uint8_t *)malloc(len);
+    gpu_parity[1] = (uint8_t *)malloc(len);
+    cudaMemcpy(gpu_parity[0], d_parity[0], len, cudaMemcpyDeviceToHost);
+    cudaMemcpy(gpu_parity[1], d_parity[1], len, cudaMemcpyDeviceToHost);
+
+    uint8_t *cpu_parity[2];
+    cpu_parity[0] = (uint8_t *)malloc(len);
+    cpu_parity[1] = (uint8_t *)malloc(len);
+    
+    cpu_ec_encode_2((const void **)h_data, k, len, (void **)cpu_parity, ec_mode);
+
+    if (memcmp(gpu_parity[0], cpu_parity[0], len) != 0 ||
+        memcmp(gpu_parity[1], cpu_parity[1], len) != 0) {
+        free(gpu_parity[0]); free(gpu_parity[1]);
+        free(cpu_parity[0]); free(cpu_parity[1]);
+        cudaFree(d_parity[0]); cudaFree(d_parity[1]);
+        cudaStreamDestroy(stream);
+        free_gpu_stripes(d_ptrs, h_data, k);
+        TEST_FAIL(name, "parity mismatch");
+    }
+
+    free(gpu_parity[0]); free(gpu_parity[1]);
+    free(cpu_parity[0]); free(cpu_parity[1]);
+    cudaFree(d_parity[0]); cudaFree(d_parity[1]);
+    cudaStreamDestroy(stream);
+    free_gpu_stripes(d_ptrs, h_data, k);
+    TEST_PASS(name);
+    return 0;
+}
+
+static int test_ec_2plus2(void)
+{
+    return test_ec_n_plus_2(2, 4096, 0, "ec_2plus2");
+}
+
+static int test_ec_4plus2(void)
+{
+    return test_ec_n_plus_2(4, 65536, 0, "ec_4plus2");
+}
+
+static int test_ec_8plus2(void)
+{
+    return test_ec_n_plus_2(8, 131072, 0, "ec_8plus2");
+}
+
 int main(void)
 {
     printf("=== test_ec ===\n");
@@ -180,6 +277,9 @@ int main(void)
     failures += test_ec_4plus1();
     failures += test_ec_8plus1();
     failures += test_ec_verify();
+    failures += test_ec_2plus2();
+    failures += test_ec_4plus2();
+    failures += test_ec_8plus2();
     printf("=== %s (%d failures) ===\n", failures ? "FAILED" : "PASSED", failures);
     return failures;
 }

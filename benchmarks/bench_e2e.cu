@@ -242,7 +242,7 @@ static void bench_ec_encode_e2e(gpu_engine_t *eng,
     for (int i = 0; i < 5; i++) {
         cudaMemcpyAsync(d_data_contig, h_data_contig, k * cell_size, cudaMemcpyHostToDevice, stream);
         cudaStreamSynchronize(stream);
-        gpu_ec_encode_multi_sm(d_stripes, d_parity, k, p, cell_size, stream);
+        gpu_ec_encode_multi_sm(d_stripes, d_parity, k, p, cell_size, stream, GPU_EC_MODE_NATIVE);
     }
 
     for (int i = 0; i < iterations; i++) {
@@ -254,7 +254,7 @@ static void bench_ec_encode_e2e(gpu_engine_t *eng,
         cudaStreamSynchronize(stream);
 
         /* 2. Compute: direct multi-SM EC encode (all SMs) */
-        gpu_ec_encode_multi_sm(d_stripes, d_parity, k, p, cell_size, stream);
+        gpu_ec_encode_multi_sm(d_stripes, d_parity, k, p, cell_size, stream, GPU_EC_MODE_NATIVE);
 
         /* 3. D2H: single contiguous async copy */
         cudaMemcpyAsync(h_parity_contig, d_parity_contig, p * cell_size,
@@ -399,7 +399,7 @@ static void bench_ec_e2e_throughput(gpu_engine_t *eng,
                 cudaStreamSynchronize(s);
 
                 /* 2. Compute: direct multi-SM EC encode */
-                gpu_ec_encode_multi_sm(d_stripes, d_par, k, p, cell_size, s);
+                gpu_ec_encode_multi_sm(d_stripes, d_par, k, p, cell_size, s, GPU_EC_MODE_NATIVE);
 
                 /* 3. D2H: single contiguous async copy (p * cell_size) */
                 cudaMemcpyAsync(b->h_parity_contig, b->d_parity_contig,

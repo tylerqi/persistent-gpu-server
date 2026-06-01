@@ -303,7 +303,7 @@ static int test_cpu_decode_descending(const int *failed_idx, const char *test_na
     out_ptrs[0] = (uint8_t *)malloc(len);
     out_ptrs[1] = (uint8_t *)malloc(len);
     
-    cpu_ec_decode(ec_ptrs, parity_ptrs, k, p, len, failed_idx, 2, (void **)out_ptrs);
+    cpu_ec_decode(ec_ptrs, parity_ptrs, k, p, len, failed_idx, 2, (void **)out_ptrs, GPU_EC_MODE_NATIVE);
     
     int failed = 0;
     if (memcmp(out_ptrs[0], h_orig[failed_idx[0]], len) != 0) {
@@ -474,7 +474,7 @@ static int test_xor_parity_zero_len(void) {
 
 static int test_multi_sm_null_ptrs(void) {
     void *d_parity_ptrs[2] = {};
-    int rc = gpu_ec_encode_multi_sm(NULL, d_parity_ptrs, 4, 2, 4096, 0);
+    int rc = gpu_ec_encode_multi_sm(NULL, d_parity_ptrs, 4, 2, 4096, 0, GPU_EC_MODE_NATIVE);
     if (rc != 0) {
         TEST_PASS("multi_sm_null_ptrs");
         return 0;

@@ -1,5 +1,7 @@
 # Design Document: Persistent GPU Storage Engine
 
+> 🌐 [中文版本](./DESIGN_zh.md)
+
 ## 1. Problem Statement
 
 Modern storage systems like DAOS perform intensive compute on the data path — checksumming every I/O for integrity, generating erasure coding parity for fault tolerance, and compressing data for capacity efficiency. On high-throughput NVMe systems processing millions of IOPS, these operations consume significant CPU resources.
