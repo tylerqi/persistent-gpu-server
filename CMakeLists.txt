@@ -22,7 +22,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -allow-unsupp
 # Generate native SASS for direct execution
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH}")
 # Disable CMake's auto-gencode since we handle it manually
-set(CMAKE_CUDA_ARCHITECTURES OFF)
+# set(CMAKE_CUDA_ARCHITECTURES OFF)
 
 # ── Dependencies ─────────────────────────────────────────────────────────
 # Search for MathDx (nvCOMPDx) for device-side compression

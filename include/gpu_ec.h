@@ -10,6 +10,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#if !defined(__CUDACC__) && !defined(CUDA_VERSION) && !defined(_CUDA_RUNTIME_H) && !defined(__CUDA_RUNTIME_H__)
+typedef struct CUstream_st *cudaStream_t;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
